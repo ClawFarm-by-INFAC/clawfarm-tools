@@ -894,10 +894,69 @@ setup_built_in_skills() {
         return 0
     fi
 
-    # Skip skills setup for now - it can be configured manually later
-    print_info "Built-in skills setup skipped - can be configured manually"
-    print_info "Use 'docker exec <container> openclaw skills list' to see available skills"
-    print_success "Built-in skills setup completed"
+    print_info "Copying built-in skills to workspace..."
+
+    # Copy skills from bundled location to workspace
+    local bundled_skills_dir="/usr/local/share/openclaw/skills"
+    local workspace_skills_dir="/workspace/skills"
+
+    # First, create the skills directory in workspace if it doesn't exist
+    docker exec "${GATEWAY_NAME}" mkdir -p "$workspace_skills_dir" 2>/dev/null || true
+
+    # Copy each skill directory from bundled location to workspace
+    local skills_copied=0
+    local skills_failed=0
+
+    # Get list of skill directories (skip markdown files and non-directories)
+    # Try GNU find first, fallback to BSD/macOS find
+    local skill_dirs
+    skill_dirs=$(docker exec "${GATEWAY_NAME}" find "$bundled_skills_dir" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" 2>/dev/null)
+
+    if [[ -z "$skill_dirs" ]]; then
+        # Fallback for BSD/macOS find
+        skill_dirs=$(docker exec "${GATEWAY_NAME}" find "$bundled_skills_dir" -mindepth 1 -maxdepth 1 -type d | while read -r dir; do basename "$dir"; done)
+    fi
+
+    if [[ -z "$skill_dirs" ]]; then
+        print_warning "No built-in skills found in $bundled_skills_dir"
+        print_info "Skills may already be bundled in the OpenClaw installation"
+        print_success "Built-in skills setup completed"
+        return 0
+    fi
+
+    # Copy each skill
+    while IFS= read -r skill_name; do
+        if [[ -n "$skill_name" ]]; then
+            print_info "Copying skill: $skill_name"
+
+            if docker exec "${GATEWAY_NAME}" cp -rf "$bundled_skills_dir/$skill_name" "$workspace_skills_dir/" 2>/dev/null; then
+                print_success "Copied: $skill_name"
+                skills_copied=$((skills_copied + 1))
+            else
+                print_warning "Failed to copy: $skill_name"
+                skills_failed=$((skills_failed + 1))
+            fi
+        fi
+    done <<< "$skill_dirs"
+
+    # Set proper permissions
+    if [[ $skills_copied -gt 0 ]]; then
+        print_info "Setting permissions on skills directory..."
+        docker exec "${GATEWAY_NAME}" chown -R openclaw:openclaw "$workspace_skills_dir" 2>/dev/null || true
+    fi
+
+    # Summary
+    echo ""
+    if [[ $skills_copied -gt 0 ]]; then
+        print_success "Built-in skills setup completed ($skills_copied skills copied)"
+    else
+        print_info "No new skills to copy (may already exist)"
+    fi
+
+    if [[ $skills_failed -gt 0 ]]; then
+        print_warning "$skills_failed skill(s) failed to copy"
+    fi
+
     return 0
 }
 
