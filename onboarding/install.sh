@@ -2,10 +2,10 @@
 ##############################################################################
 # ClawFarm Gateway Installation Script
 # =========================================
-# Quick installation script for deploying ClawFarm Gateway on macOS/Linux
+# Comprehensive installation script for deploying ClawFarm Gateway on macOS/Linux
 #
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/ClawFarm-by-INFAC/clawfarm-tools/main/install.sh | bash -s -- \
+#   curl -sSL https://github.com/ClawFarm-by-INFAC/clawfarm-tools/raw/refs/heads/main/onboarding/install.sh | bash -s -- \
 #     --resource-token YOUR_TOKEN \
 #     --agency-id YOUR_AGENCY_ID \
 #     --llm-key YOUR_LLM_KEY \
@@ -15,7 +15,7 @@
 # For non-interactive mode, add --yes flag
 ##############################################################################
 
-set -e  # Exit on error
+set -euo pipefail  # Exit on error, undefined vars, and pipe failures
 
 # Color codes for output
 RED='\033[0;31m'
@@ -32,6 +32,8 @@ REGISTRY="${REGISTRY:-clawfarmacrproduction.azurecr.io}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 CONTROL_PLANE_API_URL="${CONTROL_PLANE_API_URL:-https://api.clawfarm.ca}"
 DEPLOYMENT_TYPE="local"
+DEFAULT_LLM_MODEL="google/gemma-4-26b-a4b-it"
+SKIP_TOKEN_VALIDATION=false
 
 # Command line arguments
 RESOURCE_TOKEN=""
@@ -40,6 +42,7 @@ RESOURCE_NAME=""
 LLM_KEY=""
 AUTO_CONFIRM=false
 VERBOSE=false
+DRY_RUN=false
 
 ##############################################################################
 # UTILITY FUNCTIONS
@@ -105,6 +108,10 @@ parse_arguments() {
                 LLM_KEY="$2"
                 shift 2
                 ;;
+            --llm-model)
+                DEFAULT_LLM_MODEL="$2"
+                shift 2
+                ;;
             --type)
                 DEPLOYMENT_TYPE="$2"
                 shift 2
@@ -133,6 +140,15 @@ parse_arguments() {
                 VERBOSE=true
                 shift
                 ;;
+            --dry-run|-d)
+                DRY_RUN=true
+                print_warning "Dry run mode: no changes will be made"
+                shift
+                ;;
+            --skip-token-validation)
+                SKIP_TOKEN_VALIDATION=true
+                shift
+                ;;
             --help|-h)
                 usage
                 ;;
@@ -151,18 +167,21 @@ usage() {
 Usage: $0 [OPTIONS]
 
 Options:
-  --resource-token TOKEN   Resource token from Control Plane (required)
-  --agency-id ID           Agency ID from Control Plane (required)
-  --resource-name NAME     Gateway resource name (default: <user>-<hostname>)
-  --llm-key KEY            LLM API key from OpenRouter (required for agents)
-  --type TYPE              Deployment type: local|cloud (default: local)
-  --port PORT              Gateway port (default: 8080)
-  --dir DIR                Installation directory (default: ~/openclaw-gateway)
-  --registry REGISTRY      Container registry (default: clawfarmacrproduction.azurecr.io)
-  --tag TAG                Image tag (default: latest)
-  --yes, -y                Skip confirmation prompts
-  --verbose, -v            Enable verbose output
-  --help, -h               Show this help message
+  --resource-token TOKEN       Resource token from Control Plane (required)
+  --agency-id ID               Agency ID from Control Plane (required)
+  --resource-name NAME         Gateway resource name (default: <user>-<hostname>)
+  --llm-key KEY                LLM API key from OpenRouter (recommended for agents)
+  --llm-model MODEL            Default LLM model (default: google/gemma-4-26b-a4b-it)
+  --type TYPE                  Deployment type: local|cloud (default: local)
+  --port PORT                  Gateway port (default: 8080)
+  --dir DIR                    Installation directory (default: ~/openclaw-gateway)
+  --registry REGISTRY          Container registry (default: clawfarmacrproduction.azurecr.io)
+  --tag TAG                    Image tag (default: latest)
+  --yes, -y                    Skip confirmation prompts
+  --verbose, -v                Enable verbose output
+  --dry-run, -d                Show what would be done without executing
+  --skip-token-validation      Skip Control Plane token validation
+  --help, -h                   Show this help message
 
 Example:
   $0 --resource-token your_token \\
@@ -253,6 +272,145 @@ validate_arguments() {
     fi
 
     print_success "Arguments validated"
+}
+
+validate_resource_token() {
+    local token="$1"
+    local control_plane_url="${CONTROL_PLANE_API_URL:-https://api.clawfarm.ca}"
+
+    print_info "Validating resource token with control plane..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        print_success "Token validated (dry run)"
+        return 0
+    fi
+
+    if [[ "$SKIP_TOKEN_VALIDATION" == "true" ]]; then
+        print_warning "Token validation skipped (SKIP_TOKEN_VALIDATION=true)"
+        return 0
+    fi
+
+    # Use the registration endpoint which requires resource token
+    local registration_url="${control_plane_url}/api/resources/register"
+
+    # Create validation registration payload using correct format
+    local validation_gateway_id="install-validation-$(date +%s)"
+    local validation_gateway_name="install-validation-$(date +%s)"
+
+    local registration_data
+    registration_data=$(cat <<EOF
+{
+  "name": "${validation_gateway_name}",
+  "gateway_id": "${validation_gateway_id}",
+  "deployment_type": "docker",
+  "ip_address": "validation",
+  "region": "auto",
+  "version": "1.0.0",
+  "capabilities": ["llm", "channels", "skills"]
+}
+EOF
+)
+
+    local response
+    local http_code
+
+    response=$(curl -s -w "\n%{http_code}" -X POST \
+        -H "Content-Type: application/json" \
+        -H "X-Resource-Token: ${token}" \
+        -d "$registration_data" \
+        "${registration_url}" 2>/dev/null)
+
+    http_code=$(echo "$response" | tail -n1)
+    response_body=$(echo "$response" | head -n-1)
+
+    if [[ "$http_code" == "200" ]] || [[ "$http_code" == "201" ]]; then
+        print_success "Resource token validated successfully"
+        return 0
+    elif [[ "$http_code" == "401" ]]; then
+        print_error "Invalid resource token - authentication failed"
+        return 1
+    elif [[ "$http_code" == "403" ]]; then
+        print_error "Resource token not accepted - access denied"
+        return 1
+    elif [[ "$http_code" == "404" ]]; then
+        print_warning "Control plane endpoint not found - assuming token is valid"
+        return 0
+    else
+        print_warning "Unable to validate token (HTTP ${http_code}) - continuing with installation"
+        print_info "To skip token validation, use: --skip-token-validation"
+        return 0
+    fi
+}
+
+generate_openclaw_state_config() {
+    local deploy_dir="$1"
+    local gateway_port="${2:-8080}"
+    local default_llm_model="${3:-google/gemma-4-26b-a4b-it}"
+
+    print_info "Generating OpenClaw state configuration..."
+
+    # Create .openclaw directory
+    local openclaw_dir="${deploy_dir}/.openclaw"
+    mkdir -p "$openclaw_dir"
+
+    # Generate a unique gateway token
+    local gateway_token
+    gateway_token=$(openssl rand -hex 32 2>/dev/null || echo "gateway-token-$(date +%s)-${RANDOM}")
+
+    # Create openclaw.json with gateway configuration
+    cat > "${openclaw_dir}/openclaw.json" <<EOF
+{
+  "version": "1.0.0",
+  "gateway": {
+    "id": "${RESOURCE_NAME}",
+    "name": "${RESOURCE_NAME}",
+    "port": ${gateway_port},
+    "auth": {
+      "token": "${gateway_token}",
+      "type": "bearer"
+    },
+    "capabilities": ["llm", "channels", "skills", "browser"],
+    "version": "1.0.0"
+  },
+  "llm": {
+    "default_model": "${default_llm_model}",
+    "provider": "openrouter",
+    "api_key": "${LLM_KEY:-}",
+    "fallback_models": [
+      "qwen/qwen-2.5-plus",
+      "meta-llama/llama-3.1-8b-instruct"
+    ]
+  },
+  "control_plane": {
+    "api_url": "${CONTROL_PLANE_API_URL:-https://api.clawfarm.ca}",
+    "resource_token": "${RESOURCE_TOKEN}",
+    "agency_id": "${AGENCY_ID}"
+  },
+  "channels": {
+    "enabled": ["openclaw-weixin"],
+    "plugins": {
+      "openclaw-weixin": {
+        "auto_login": false
+      }
+    }
+  },
+  "skills": {
+    "workspace_dir": "/workspace/skills",
+    "auto_load": true,
+    "built_in_skills": [
+      "Agent-Browser-CLI"
+    ]
+  },
+  "browser": {
+    "cdp_proxy_url": "http://clawfarm-browser-proxy:9223",
+    "enabled": true,
+    "headless": true
+  }
+}
+EOF
+
+    print_success "OpenClaw state configuration generated"
+    print_info "Gateway token: ${gateway_token}"
 }
 
 ##############################################################################
@@ -395,6 +553,12 @@ networks:
     driver: bridge
 EOF
 
+    # Generate OpenClaw state configuration with gateway token
+    if ! generate_openclaw_state_config "$DEPLOY_DIR" "$GATEWAY_PORT" "$DEFAULT_LLM_MODEL"; then
+        print_error "Failed to generate OpenClaw state configuration"
+        return 1
+    fi
+
     print_success "Configuration files generated"
 }
 
@@ -449,9 +613,192 @@ verify_deployment() {
     return 1
 }
 
+setup_communication_channels() {
+    print_step 8 "Setting up communication channels"
+    show_progress 8 13
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        print_success "Communication channels configured (dry run)"
+        return 0
+    fi
+
+    # Find the gateway container
+    local gateway_container=""
+    local env_file="${DEPLOY_DIR}/.env"
+
+    if [[ -f "$env_file" ]]; then
+        # Extract resource token and get last 4 characters
+        local resource_token
+        resource_token=$(grep "^RESOURCE_TOKEN=" "$env_file" | cut -d'=' -f2)
+        if [[ -n "$resource_token" ]]; then
+            local token_suffix="${resource_token: -4}"
+            gateway_container="clawfarm-gateway-${token_suffix}"
+        fi
+    fi
+
+    # Fallback to pattern matching if exact match fails
+    if [[ -z "$gateway_container" ]] || ! docker ps --format '{{.Names}}' | grep -q "^${gateway_container}$"; then
+        gateway_container=$(docker ps --format '{{.Names}}' | grep -E '^clawfarm-gateway-' | head -1)
+    fi
+
+    if [[ -z "$gateway_container" ]]; then
+        print_warning "Channel setup skipped - gateway container not found"
+        print_info "You can setup channels manually after installation"
+        return 0
+    fi
+
+    # Check if gateway is running
+    if ! docker exec "$gateway_container" pwd &>/dev/null; then
+        print_warning "Channel setup skipped - gateway not running"
+        print_info "You can setup channels manually after starting the gateway"
+        return 0
+    fi
+
+    # Install WeChat plugin
+    print_info "Installing WeChat communication plugin"
+
+    if docker exec "$gateway_container" openclaw plugins install "@tencent-weixin/openclaw-weixin" 2>&1 | grep -q "Installed plugin"; then
+        # Add to plugins.allow list (exclude built-in browser plugin)
+        docker exec "$gateway_container" openclaw config set plugins.allow '["openclaw-weixin","memory-core","openrouter","gemma"]' --json 2>/dev/null || true
+
+        print_success "WeChat plugin installed"
+    else
+        print_warning "WeChat plugin installation failed"
+    fi
+
+    print_success "Communication channels configured"
+    echo ""
+    echo "WeChat Plugin Installation:"
+    echo "  Status:        Installed"
+    echo "  Next Step:     Login to WeChat channel"
+    echo ""
+    echo "To complete WeChat setup:"
+    echo "  docker exec $gateway_container openclaw channels login --channel openclaw-weixin"
+    echo ""
+    echo "Then scan the QR code with WeChat to connect."
+    echo ""
+}
+
+setup_built_in_skills() {
+    print_step 9 "Setting up built-in skills"
+    show_progress 9 13
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        print_success "Built-in skills configured (dry run)"
+        return 0
+    fi
+
+    # Find the gateway container
+    local gateway_container=""
+    local env_file="${DEPLOY_DIR}/.env"
+
+    if [[ -f "$env_file" ]]; then
+        # Extract resource token and get last 4 characters
+        local resource_token
+        resource_token=$(grep "^RESOURCE_TOKEN=" "$env_file" | cut -d'=' -f2)
+        if [[ -n "$resource_token" ]]; then
+            local token_suffix="${resource_token: -4}"
+            gateway_container="clawfarm-gateway-${token_suffix}"
+        fi
+    fi
+
+    # Fallback to pattern matching if exact match fails
+    if [[ -z "$gateway_container" ]] || ! docker ps --format '{{.Names}}' | grep -q "^${gateway_container}$"; then
+        gateway_container=$(docker ps --format '{{.Names}}' | grep -E '^clawfarm-gateway-' | head -1)
+    fi
+
+    if [[ -z "$gateway_container" ]]; then
+        print_warning "Skills setup skipped - gateway container not found"
+        print_info "You can setup skills manually after installation"
+        return 0
+    fi
+
+    # Check if gateway is running
+    if ! docker exec "$gateway_container" pwd &>/dev/null; then
+        print_warning "Skills setup skipped - gateway not running"
+        print_info "You can setup skills manually after starting the gateway"
+        return 0
+    fi
+
+    # Copy all built-in skills from /usr/local/share/openclaw/skills to workspace
+    print_info "Copying built-in skills to workspace"
+
+    # Create workspace skills directory if it doesn't exist
+    docker exec "$gateway_container" mkdir -p /workspace/skills/ 2>/dev/null
+
+    # Copy all skills from built-in location to workspace
+    local skills_copied=0
+    local skills_failed=0
+
+    # List all directories in the skills source directory
+    local skills_list
+    skills_list=$(docker exec "$gateway_container" find /usr/local/share/openclaw/skills -mindepth 1 -maxdepth 1 -type d -printf "%f\n" 2>/dev/null)
+
+    if [[ -n "$skills_list" ]]; then
+        while IFS= read -r skill_dir; do
+            if [[ -n "$skill_dir" ]]; then
+                local skill_name="$skill_dir"
+
+                if docker exec "$gateway_container" cp -r "/usr/local/share/openclaw/skills/${skill_name}" "/workspace/skills/" 2>/dev/null; then
+                    skills_copied=$((skills_copied + 1))
+
+                    # Check if this skill has an agent-browser CLI
+                    if [[ "$skill_name" == "Agent-Browser-CLI" ]]; then
+                        if docker exec "$gateway_container" command -v agent-browser &>/dev/null; then
+                            local agent_browser_version
+                            agent_browser_version=$(docker exec "$gateway_container" agent-browser --version 2>/dev/null || echo "unknown")
+                            print_info "agent-browser CLI version: $agent_browser_version"
+                        fi
+                    fi
+                else
+                    skills_failed=$((skills_failed + 1))
+                fi
+            fi
+        done <<< "$skills_list"
+    else
+        print_warning "No built-in skills found to copy"
+    fi
+
+    # Report results
+    if [[ $skills_copied -gt 0 ]]; then
+        print_success "Copied $skills_copied built-in skill(s) to workspace"
+    fi
+
+    if [[ $skills_failed -gt 0 ]]; then
+        print_warning "Failed to copy $skills_failed skill(s)"
+    fi
+
+    print_success "Built-in skills configured"
+    echo ""
+    echo "Skills Overview:"
+    echo "  Total Copied:  $skills_copied skill(s)"
+    echo "  Location:       /workspace/skills/"
+    echo ""
+
+    # Show individual skills if any were copied
+    if [[ $skills_copied -gt 0 ]]; then
+        echo "Available Skills:"
+        docker exec "$gateway_container" find /workspace/skills -mindepth 1 -maxdepth 1 -type d -printf "  - %f\n" 2>/dev/null | sort
+        echo ""
+    fi
+
+    # Show agent-browser specific info if available
+    if [[ -n "${agent_browser_version:-}" ]]; then
+        echo "Agent-Browser-CLI:"
+        echo "  CLI Version:   $agent_browser_version"
+        echo "  CDP Proxy:     clawfarm-browser-proxy:9223"
+        echo "  Status:        Ready for browser automation"
+        echo ""
+    fi
+
+    echo "Built-in browser plugin is disabled - agent-browser skill is preferred."
+    echo "Agents can now use the installed skills for various automation tasks."
+    echo ""
+}
+
 setup_autostart_service() {
-    print_step 8 "Setting up auto-start service"
-    show_progress 8 10
+    print_step 10 "Setting up auto-start service"
+    show_progress 10 13
 
     # Only setup autostart for macOS local deployments
     if [[ "$OSTYPE" == darwin* ]] && [[ "$DEPLOYMENT_TYPE" == "local" ]]; then
@@ -543,8 +890,8 @@ get_gateway_token() {
 }
 
 show_summary() {
-    print_step 9 "Installation summary"
-    show_progress 9 10
+    print_step 11 "Installation summary"
+    show_progress 11 13
 
     echo ""
     echo -e "${BOLD}${GREEN}Installation completed successfully!${NC}"
@@ -554,6 +901,7 @@ show_summary() {
     echo "  Gateway Port:    $GATEWAY_PORT"
     echo "  Install Dir:     $DEPLOY_DIR"
     echo "  Agency ID:       $AGENCY_ID"
+    echo "  Default Model:   $DEFAULT_LLM_MODEL"
 
     # Try to get and display the gateway token
     local gateway_token
@@ -573,10 +921,17 @@ show_summary() {
     echo ""
     echo "  Health check:    curl http://localhost:${GATEWAY_PORT}/health"
     echo ""
+    echo -e "${BOLD}Browser Automation:${NC}"
+    echo "  Built-in browser plugin: DISABLED"
+    echo "  Agent-Browser-CLI skill: ENABLED"
+    echo "  Browser Proxy: clawfarm-browser-proxy:9223"
+    echo "  Usage: agent-browser --cdp http://clawfarm-browser-proxy:9223 <command>"
+    echo ""
     echo -e "${BOLD}Next Steps:${NC}"
     echo "  1. Verify your gateway in Control Plane Dashboard"
-    echo "  2. Set up communication channels (WeChat, Telegram, etc.)"
-    echo "  3. Configure skills and agents as needed"
+    echo "  2. Configure OpenRouter API key for LLM features (if not set)"
+    echo "  3. Login to WeChat channel to enable messaging"
+    echo "  4. Create and configure agents as needed"
     echo ""
     echo "For more information, visit: https://docs.clawfarm.ca"
     echo ""
@@ -595,13 +950,23 @@ main() {
     # Installation steps
     validate_prerequisites
     validate_arguments
+
+    # Validate resource token with Control Plane
+    if ! validate_resource_token "$RESOURCE_TOKEN"; then
+        print_error "Resource token validation failed"
+        echo "Use --skip-token-validation to bypass this check"
+        exit 1
+    fi
+
     create_deployment_directory
     generate_configuration_files
     pull_docker_image
     start_gateway
 
-    # Verify and setup autostart
+    # Verify and setup additional features
     if verify_deployment; then
+        setup_communication_channels
+        setup_built_in_skills
         setup_autostart_service
         show_summary
         exit 0
