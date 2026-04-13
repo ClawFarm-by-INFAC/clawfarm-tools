@@ -1425,12 +1425,23 @@ install_wechat_plugin() {
 
     # Fallback to pattern matching if exact match fails
     if [[ -z "$gateway_container" ]] || ! docker ps --format '{{.Names}}' | grep -q "^${gateway_container}$"; then
-        gateway_container=$(docker ps --format '{{.Names}}' | grep -E '^clawfarm-gateway-' | head -1)
+        gateway_container=$(docker ps --format '{{.Names}}' | grep -E '^clawfarm-gateway-' | head -1 || true)
+    fi
+
+    # Another fallback: try to find container by GATEWAY_NAME from .env
+    if [[ -z "$gateway_container" ]] && [[ -f "$env_file" ]]; then
+        local gateway_name
+        gateway_name=$(grep "^GATEWAY_NAME=" "$env_file" | cut -d'=' -f2 || true)
+        if [[ -n "$gateway_name" ]] && docker ps --format '{{.Names}}' | grep -q "^${gateway_name}$"; then
+            gateway_container="$gateway_name"
+        fi
     fi
 
     if [[ -z "$gateway_container" ]]; then
         print_error "Gateway container not found"
         print_info "Make sure the gateway is running: cd $DEPLOY_DIR && docker-compose up -d"
+        print_info "Running containers:"
+        docker ps --format "  - {{.Names}}"
         exit 1
     fi
 
@@ -1446,12 +1457,33 @@ install_wechat_plugin() {
     # Install WeChat plugin
     print_info "Installing WeChat communication plugin..."
 
-    if docker exec "$gateway_container" openclaw plugins install "@tencent-weixin/openclaw-weixin" 2>&1 | grep -q "Installed plugin"; then
-        print_success "WeChat plugin installed successfully"
+    # First check if plugin is already installed
+    local plugin_check
+    plugin_check=$(timeout 5 docker exec "$gateway_container" openclaw plugins list 2>/dev/null | grep -i "openclaw-weixin" || true)
+
+    if [[ -n "$plugin_check" ]]; then
+        print_success "WeChat plugin already installed"
     else
-        print_error "WeChat plugin installation failed"
-        print_info "Check gateway logs for more information"
-        exit 1
+        # Try to install with timeout to prevent hanging
+        local install_output
+        install_output=$(timeout 30 docker exec "$gateway_container" openclaw plugins install "@tencent-weixin/openclaw-weixin" 2>&1 || echo "TIMEOUT")
+
+        if echo "$install_output" | grep -q "Installed plugin"; then
+            print_success "WeChat plugin installed successfully"
+        elif echo "$install_output" | grep -q "plugin already exists"; then
+            print_success "WeChat plugin already installed"
+        elif echo "$install_output" == "TIMEOUT"; then
+            print_warning "WeChat plugin installation timed out"
+            print_info "The plugin installation may be in progress or hung"
+            print_info "Please check manually with: docker exec $gateway_container openclaw plugins list"
+            exit 1
+        else
+            print_error "WeChat plugin installation failed"
+            print_info "Error output:"
+            echo "$install_output" | head -10
+            print_info "Check gateway logs for more information"
+            exit 1
+        fi
     fi
 
     # Add to plugins.allow list
