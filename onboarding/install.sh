@@ -1134,6 +1134,9 @@ verify_launchagents() {
 
     print_info "Verifying LaunchAgent registration..."
 
+    # Give launchctl a moment to process the registrations
+    sleep 2
+
     local -a launch_agent_ids=(
         "com.clawfarm.gateway"
         "ca.clawfarm.browser"
