@@ -916,7 +916,11 @@ setup_built_in_skills() {
     # Copy the entire skills directory (run as node user for permissions)
     print_info "Copying skills directory..."
 
-    if docker exec -u node "${gateway_name}" cp -r "$bundled_skills_dir" "$target_dir" 2>/dev/null; then
+    # Create target directory first
+    docker exec -u node "${gateway_name}" mkdir -p "$target_dir" 2>/dev/null || true
+
+    # Copy skills directory contents
+    if docker exec -u node "${gateway_name}" cp -r "$bundled_skills_dir"/. "$target_dir/" 2>/dev/null; then
         # Count copied skills
         local skill_count
         skill_count=$(docker exec "${gateway_name}" find "$target_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
