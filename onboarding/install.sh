@@ -911,18 +911,15 @@ setup_built_in_skills() {
 
     # Copy skills from bundled location to workspace
     local bundled_skills_dir="/usr/local/share/openclaw/skills"
-    local workspace_dir="/workspace"
+    local target_dir="/home/node/.openclaw/skills"
 
-    # Copy the entire skills directory to workspace
+    # Copy the entire skills directory (run as node user for permissions)
     print_info "Copying skills directory..."
 
-    if docker exec "${gateway_name}" cp -r "$bundled_skills_dir" "$workspace_dir/" 2>/dev/null; then
-        # Set proper permissions
-        docker exec "${gateway_name}" chown -R openclaw:openclaw "$workspace_dir/skills" 2>/dev/null || true
-
+    if docker exec -u node "${gateway_name}" cp -r "$bundled_skills_dir" "$target_dir" 2>/dev/null; then
         # Count copied skills
         local skill_count
-        skill_count=$(docker exec "${gateway_name}" find "$workspace_dir/skills" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+        skill_count=$(docker exec "${gateway_name}" find "$target_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
 
         print_success "Built-in skills setup completed (copied $skill_count skill(s))"
     else
