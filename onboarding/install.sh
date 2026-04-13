@@ -49,6 +49,7 @@ VERBOSE=false
 DRY_RUN=false
 UPDATE_LLM_KEY=false
 INSTALL_WECHAT_ONLY=false
+SHOW_GATEWAY_TOKEN=false
 INCLUDE_WECHAT=false
 
 ##############################################################################
@@ -175,6 +176,10 @@ parse_arguments() {
                 INSTALL_WECHAT_ONLY=true
                 shift
                 ;;
+            --show-gateway-token)
+                SHOW_GATEWAY_TOKEN=true
+                shift
+                ;;
             --with-wechat)
                 INCLUDE_WECHAT=true
                 shift
@@ -210,6 +215,7 @@ Options:
   --tag TAG                    Image tag (default: latest)
   --update-llm-key             Update LLM key and force recreate containers
   --install-wechat-only        Install WeChat plugin only on existing gateway (requires running gateway)
+  --show-gateway-token         Display the gateway token from existing installation
   --with-wechat                Include WeChat plugin installation during setup
   --yes, -y                    Skip confirmation prompts
   --verbose, -v                Enable verbose output
@@ -234,6 +240,10 @@ Examples:
   # Install WeChat plugin on running gateway
   $0 --dir ~/openclaw-gateway \\
       --install-wechat-only --yes
+
+  # Show gateway token
+  $0 --dir ~/openclaw-gateway \\
+      --show-gateway-token
 
   # Full installation with WeChat plugin
   $0 --type local \\
@@ -1105,6 +1115,58 @@ EOF
     print_success "Gateway auto-start configuration completed"
 }
 
+show_gateway_token() {
+    print_header
+
+    print_info "Retrieving gateway token..."
+
+    # Check if deployment directory exists
+    if [[ ! -d "$DEPLOY_DIR" ]]; then
+        print_error "Deployment directory not found: $DEPLOY_DIR"
+        print_info "The gateway may not be installed. Use --dir to specify the installation directory."
+        exit 1
+    fi
+
+    # Get the token
+    local token
+    token=$(get_gateway_token)
+
+    if [[ -z "$token" ]]; then
+        print_error "Failed to retrieve gateway token"
+        print_info "Possible reasons:"
+        print_info "  - Gateway is not installed"
+        print_info "  - Gateway configuration files are missing or corrupted"
+        print_info "  - Incorrect deployment directory specified"
+        echo ""
+        print_info "Deployment directory: $DEPLOY_DIR"
+        exit 1
+    fi
+
+    echo ""
+    echo -e "${BOLD}${GREEN}Gateway Token Retrieved Successfully!${NC}"
+    echo ""
+    echo -e "${BOLD}Gateway Token:${NC} $token"
+    echo ""
+    echo -e "${BOLD}${YELLOW}⚠ IMPORTANT: Save this token securely!${NC}"
+    echo "  This token is required for agent authentication"
+    echo "  Store it in a secure location (password manager, encrypted file, etc.)"
+    echo ""
+    echo -e "${BOLD}Deployment Details:${NC}"
+    echo "  Directory: $DEPLOY_DIR"
+
+    # Try to get additional info
+    if [[ -f "$DEPLOY_DIR/.env" ]]; then
+        local resource_name
+        resource_name=$(grep "^RESOURCE_NAME=" "$DEPLOY_DIR/.env" | cut -d'=' -f2)
+        if [[ -n "$resource_name" ]]; then
+            echo "  Resource Name: $resource_name"
+        fi
+    fi
+
+    echo ""
+    exit 0
+}
+
 get_gateway_token() {
     # Try to get the gateway token from the running container
     local container_name="${RESOURCE_NAME}"
@@ -1444,6 +1506,11 @@ main() {
 
     if [[ "$INSTALL_WECHAT_ONLY" == "true" ]]; then
         install_wechat_plugin
+        exit 0
+    fi
+
+    if [[ "$SHOW_GATEWAY_TOKEN" == "true" ]]; then
+        show_gateway_token
         exit 0
     fi
 
