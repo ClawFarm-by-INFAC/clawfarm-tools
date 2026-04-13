@@ -338,7 +338,7 @@ EOF
         "${registration_url}" 2>/dev/null)
 
     http_code=$(echo "$response" | tail -n1)
-    response_body=$(echo "$response" | head -n-1)
+    response_body=$(echo "$response" | sed '$d')
 
     if [[ "$http_code" == "200" ]] || [[ "$http_code" == "201" ]]; then
         print_success "Resource token validated successfully"
