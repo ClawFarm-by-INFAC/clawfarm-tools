@@ -918,6 +918,7 @@ show_summary() {
     echo "  Stop gateway:     cd $DEPLOY_DIR && docker-compose down"
     echo "  Start gateway:    cd $DEPLOY_DIR && docker-compose up -d"
     echo "  Restart gateway:  cd $DEPLOY_DIR && docker-compose restart"
+    echo "  Uninstall:      curl -sSL https://github.com/ClawFarm-by-INFAC/clawfarm-tools/raw/refs/heads/main/onboarding/uninstall.sh | bash -s -- --dir $DEPLOY_DIR"
     echo ""
     echo "  Health check:    curl http://localhost:${GATEWAY_PORT}/health"
     echo ""
