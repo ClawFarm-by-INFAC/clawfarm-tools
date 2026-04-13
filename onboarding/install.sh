@@ -47,6 +47,8 @@ LLM_KEY=""
 AUTO_CONFIRM=false
 VERBOSE=false
 DRY_RUN=false
+UPDATE_LLM_KEY=false
+INSTALL_WECHAT_ONLY=false
 
 ##############################################################################
 # UTILITY FUNCTIONS
@@ -164,6 +166,14 @@ parse_arguments() {
                 SKIP_TOKEN_VALIDATION=true
                 shift
                 ;;
+            --update-llm-key)
+                UPDATE_LLM_KEY=true
+                shift
+                ;;
+            --install-wechat)
+                INSTALL_WECHAT_ONLY=true
+                shift
+                ;;
             --help|-h)
                 usage
                 ;;
@@ -193,6 +203,8 @@ Options:
   --dir DIR                    Installation directory (default: ~/openclaw-gateway)
   --registry REGISTRY          Container registry (default: clawfarmacrproduction.azurecr.io)
   --tag TAG                    Image tag (default: latest)
+  --update-llm-key             Update LLM key and force recreate containers
+  --install-wechat             Install WeChat plugin and show QR code (requires running gateway)
   --yes, -y                    Skip confirmation prompts
   --verbose, -v                Enable verbose output
   --dry-run, -d                Show what would be done without executing
@@ -200,12 +212,22 @@ Options:
   --skip-docker-login          Skip Docker registry login
   --help, -h                   Show this help message
 
-Example:
+Examples:
+  # Full installation
   $0 --resource-token your_token \\
       --agency-id your_agency_id \\
       --llm-key your_llm_key \\
       --resource-name john-macbook \\
       --type local --yes
+
+  # Update LLM key and recreate containers
+  $0 --dir ~/openclaw-gateway \\
+      --llm-key new_llm_key \\
+      --update-llm-key --yes
+
+  # Install WeChat plugin on running gateway
+  $0 --dir ~/openclaw-gateway \\
+      --install-wechat --yes
 
 For more information, visit: https://docs.clawfarm.ca/installation
 USAGE
@@ -874,43 +896,54 @@ setup_built_in_skills() {
     fi
 
     # Copy all built-in skills from /usr/local/share/openclaw/skills to workspace
-    print_info "Copying built-in skills to workspace"
+    print_info "Checking for built-in skills to copy to workspace"
+
+    # Check if skills directory exists in container
+    if ! docker exec "$gateway_container" test -d /usr/local/share/openclaw/skills 2>/dev/null; then
+        print_warning "Built-in skills directory not found in container"
+        print_info "The gateway image may not include built-in skills, or they may be in a different location"
+        print_info "Agents can still use plugins and external skills"
+        return 0
+    fi
 
     # Create workspace skills directory if it doesn't exist
     docker exec "$gateway_container" mkdir -p /workspace/skills/ 2>/dev/null
 
+    # List all directories in the skills source directory (portable method)
+    local skills_list
+    skills_list=$(docker exec "$gateway_container" find /usr/local/share/openclaw/skills -mindepth 1 -maxdepth 1 -type d 2>/dev/null | while read -r skill_path; do basename "$skill_path"; done)
+
+    if [[ -z "$skills_list" ]]; then
+        print_warning "No skills found in /usr/local/share/openclaw/skills"
+        print_info "Agents can still use plugins and external skills"
+        return 0
+    fi
+
     # Copy all skills from built-in location to workspace
     local skills_copied=0
     local skills_failed=0
+    local agent_browser_version=""
 
-    # List all directories in the skills source directory
-    local skills_list
-    skills_list=$(docker exec "$gateway_container" find /usr/local/share/openclaw/skills -mindepth 1 -maxdepth 1 -type d -printf "%f\n" 2>/dev/null)
+    print_info "Found built-in skills, copying to workspace..."
 
-    if [[ -n "$skills_list" ]]; then
-        while IFS= read -r skill_dir; do
-            if [[ -n "$skill_dir" ]]; then
-                local skill_name="$skill_dir"
+    while IFS= read -r skill_name; do
+        if [[ -n "$skill_name" ]]; then
+            if docker exec "$gateway_container" cp -r "/usr/local/share/openclaw/skills/${skill_name}" "/workspace/skills/" 2>/dev/null; then
+                skills_copied=$((skills_copied + 1))
+                print_info "✓ Copied: $skill_name"
 
-                if docker exec "$gateway_container" cp -r "/usr/local/share/openclaw/skills/${skill_name}" "/workspace/skills/" 2>/dev/null; then
-                    skills_copied=$((skills_copied + 1))
-
-                    # Check if this skill has an agent-browser CLI
-                    if [[ "$skill_name" == "Agent-Browser-CLI" ]]; then
-                        if docker exec "$gateway_container" command -v agent-browser &>/dev/null; then
-                            local agent_browser_version
-                            agent_browser_version=$(docker exec "$gateway_container" agent-browser --version 2>/dev/null || echo "unknown")
-                            print_info "agent-browser CLI version: $agent_browser_version"
-                        fi
+                # Check if this skill has an agent-browser CLI
+                if [[ "$skill_name" == "agent-browser-cli" ]]; then
+                    if docker exec "$gateway_container" command -v agent-browser &>/dev/null; then
+                        agent_browser_version=$(docker exec "$gateway_container" agent-browser --version 2>/dev/null || echo "unknown")
                     fi
-                else
-                    skills_failed=$((skills_failed + 1))
                 fi
+            else
+                skills_failed=$((skills_failed + 1))
+                print_warning "✗ Failed to copy: $skill_name"
             fi
-        done <<< "$skills_list"
-    else
-        print_warning "No built-in skills found to copy"
-    fi
+        fi
+    done <<< "$skills_list"
 
     # Report results
     if [[ $skills_copied -gt 0 ]]; then
@@ -931,7 +964,7 @@ setup_built_in_skills() {
     # Show individual skills if any were copied
     if [[ $skills_copied -gt 0 ]]; then
         echo "Available Skills:"
-        docker exec "$gateway_container" find /workspace/skills -mindepth 1 -maxdepth 1 -type d -printf "  - %f\n" 2>/dev/null | sort
+        docker exec "$gateway_container" find /workspace/skills -mindepth 1 -maxdepth 1 -type d 2>/dev/null | while read -r skill_path; do basename "$skill_path"; done | sort | sed 's/^/  - /'
         echo ""
     fi
 
@@ -949,13 +982,127 @@ setup_built_in_skills() {
     echo ""
 }
 
-setup_autostart_service() {
-    print_step 11 "Setting up auto-start service"
+setup_browser_service() {
+    print_step 11 "Setting up browser service"
     show_progress 11 13
+
+    # Only setup browser service for macOS local deployments
+    if [[ "$OSTYPE" == darwin* ]] && [[ "$DEPLOYMENT_TYPE" == "local" ]]; then
+        print_info "Configuring Chrome CDP service for browser automation..."
+
+        # Check if Chrome is installed
+        if [[ ! -d "/Applications/Google Chrome.app" ]]; then
+            print_warning "Google Chrome not found - skipping browser service setup"
+            print_info "Install Chrome from https://google.com/chrome for browser automation features"
+            return 0
+        fi
+
+        # Create LaunchAgents directory if it doesn't exist
+        local launch_agents_dir="$HOME/Library/LaunchAgents"
+        mkdir -p "$launch_agents_dir"
+
+        # Create Chrome profile directory
+        mkdir -p "$DEPLOY_DIR/chrome"
+
+        # Browser service identifiers
+        local browser_service_label="ca.clawfarm.browser"
+        local plist_file="$launch_agents_dir/${browser_service_label}.plist"
+        local work_dir="$(cd "$DEPLOY_DIR" && pwd)"
+        local chrome_cdp_port="${CHROME_CDP_PORT:-9222}"
+
+        # Generate browser service LaunchAgent plist
+        cat > "$plist_file" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${browser_service_label}</string>
+
+    <key>Comment</key>
+    <string>ClawFarm Chrome with CDP for Browser Automation</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>WorkingDirectory</key>
+    <string>${work_dir}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/Applications/Google Chrome.app/Contents/MacOS/Google Chrome</string>
+      <string>--remote-debugging-address=127.0.0.1</string>
+      <string>--remote-debugging-port=${chrome_cdp_port}</string>
+      <string>--user-data-dir=${work_dir}/chrome</string>
+      <string>--no-first-run</string>
+      <string>--no-default-browser-check</string>
+      <string>--disable-sync</string>
+      <string>--disable-background-networking</string>
+      <string>--disable-component-update</string>
+      <string>--disable-features=Translate,MediaRouter</string>
+      <string>--disable-session-crashed-bubble</string>
+      <string>--hide-crash-restore-bubble</string>
+      <string>--password-store=basic</string>
+      <string>about:blank</string>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>${work_dir}/logs/browser-cdp.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>${work_dir}/logs/browser-cdp.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>HOME</key>
+      <string>${HOME}</string>
+      <key>PATH</key>
+      <string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin</string>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+  </dict>
+</plist>
+EOF
+
+        # Load the browser service LaunchAgent
+        if launchctl load "$plist_file" 2>/dev/null; then
+            print_success "Chrome CDP service loaded successfully"
+            print_info "Browser service will start automatically on login"
+        else
+            print_warning "Failed to load Chrome CDP service"
+            print_info "You can manually load it later with: launchctl load $plist_file"
+        fi
+
+        # Give Chrome a moment to start
+        sleep 2
+
+        # Verify Chrome CDP is accessible
+        if curl -sf "http://localhost:${chrome_cdp_port}/json/version" > /dev/null 2>&1; then
+            print_success "Chrome CDP is accessible on port ${chrome_cdp_port}"
+        else
+            print_warning "Chrome CDP not yet accessible on port ${chrome_cdp_port} (may still be starting)"
+        fi
+
+    else
+        print_info "Browser service setup skipped (not supported on this platform or deployment type)"
+        print_info "Browser automation is only supported on macOS local deployments"
+    fi
+
+    print_success "Browser service configuration completed"
+}
+
+setup_autostart_service() {
+    print_step 12 "Setting up gateway auto-start service"
+    show_progress 12 13
 
     # Only setup autostart for macOS local deployments
     if [[ "$OSTYPE" == darwin* ]] && [[ "$DEPLOYMENT_TYPE" == "local" ]]; then
-        print_info "Configuring macOS LaunchAgent for auto-start..."
+        print_info "Configuring macOS LaunchAgent for gateway auto-start..."
 
         # Create LaunchAgents directory if it doesn't exist
         local launch_agents_dir="$HOME/Library/LaunchAgents"
@@ -1001,10 +1148,10 @@ EOF
 
         # Load the LaunchAgent
         if launchctl load "$plist_file" 2>/dev/null; then
-            print_success "LaunchAgent loaded successfully"
+            print_success "Gateway LaunchAgent loaded successfully"
             print_info "Gateway will start automatically on login"
         else
-            print_warning "Failed to load LaunchAgent"
+            print_warning "Failed to load gateway LaunchAgent"
             print_info "You can manually load it later with: launchctl load $plist_file"
         fi
 
@@ -1014,11 +1161,11 @@ EOF
             print_info "Go to Docker Desktop > Settings > General > Start Docker Desktop when you log in"
         fi
     else
-        print_info "Auto-start service setup skipped (not supported on this platform)"
+        print_info "Gateway auto-start service setup skipped (not supported on this platform)"
         print_info "You can manually start the gateway with: cd $DEPLOY_DIR && docker-compose up -d"
     fi
 
-    print_success "Auto-start configuration completed"
+    print_success "Gateway auto-start configuration completed"
 }
 
 get_gateway_token() {
@@ -1043,8 +1190,8 @@ get_gateway_token() {
 }
 
 show_summary() {
-    print_step 12 "Installation summary"
-    show_progress 12 13
+    print_step 13 "Installation summary"
+    show_progress 13 13
 
     echo ""
     echo -e "${BOLD}${GREEN}Installation completed successfully!${NC}"
@@ -1075,19 +1222,225 @@ show_summary() {
     echo ""
     echo "  Health check:    curl http://localhost:${GATEWAY_PORT}/health"
     echo ""
-    echo -e "${BOLD}Browser Automation:${NC}"
-    echo "  Built-in browser plugin: DISABLED"
-    echo "  Agent-Browser-CLI skill: ENABLED"
-    echo "  Browser Proxy: clawfarm-browser-proxy:9223"
-    echo "  Usage: agent-browser --cdp http://clawfarm-browser-proxy:9223 <command>"
-    echo ""
+
+    # Show browser service info if on macOS
+    if [[ "$OSTYPE" == darwin* ]] && [[ "$DEPLOYMENT_TYPE" == "local" ]]; then
+        echo -e "${BOLD}Browser Automation:${NC}"
+        echo "  Chrome CDP Service:   ca.clawfarm.browser"
+        echo "  Chrome CDP Port:      9222"
+        echo "  Browser Proxy:        clawfarm-browser-proxy:9223"
+        echo "  Agent-Browser-CLI:    ENABLED"
+        echo ""
+        echo "  Check Chrome service: launchctl list | grep clawfarm"
+        echo "  View Chrome logs:     tail -f $DEPLOY_DIR/logs/browser-cdp.log"
+        echo "  Test Chrome CDP:      curl http://localhost:9222/json/version"
+        echo "  Test Browser Proxy:   curl http://localhost:9223/health"
+        echo ""
+    else
+        echo -e "${BOLD}Browser Automation:${NC}"
+        echo "  Browser service setup skipped (macOS local only)"
+        echo "  Built-in browser plugin: DISABLED"
+        echo "  Agent-Browser-CLI skill: ENABLED"
+        echo ""
+    fi
+
     echo -e "${BOLD}Next Steps:${NC}"
     echo "  1. Verify your gateway in Control Plane Dashboard"
     echo "  2. Configure OpenRouter API key for LLM features (if not set)"
     echo "  3. Login to WeChat channel to enable messaging"
     echo "  4. Create and configure agents as needed"
+    if [[ "$OSTYPE" == darwin* ]] && [[ "$DEPLOYMENT_TYPE" == "local" ]]; then
+        echo "  5. Test browser automation with agent-browser CLI"
+    fi
     echo ""
     echo "For more information, visit: https://docs.clawfarm.ca"
+    echo ""
+}
+
+##############################################################################
+# MAINTENANCE FUNCTIONS
+##############################################################################
+
+update_llm_key_and_recreate() {
+    print_header
+
+    print_info "Updating LLM key and recreating containers..."
+
+    # Validate we have an LLM key
+    if [[ -z "$LLM_KEY" ]]; then
+        print_error "LLM key is required for update (use --llm-key)"
+        exit 1
+    fi
+
+    # Check if deployment directory exists
+    if [[ ! -d "$DEPLOY_DIR" ]]; then
+        print_error "Deployment directory not found: $DEPLOY_DIR"
+        print_info "Have you installed the gateway yet?"
+        exit 1
+    fi
+
+    cd "$DEPLOY_DIR" || exit 1
+
+    # Check if .env file exists
+    if [[ ! -f ".env" ]]; then
+        print_error "Environment file not found: $DEPLOY_DIR/.env"
+        exit 1
+    fi
+
+    # Update the .env file with the new LLM key
+    print_info "Updating OPENROUTER_API_KEY in .env file..."
+
+    if [[ "$OSTYPE" == darwin* ]]; then
+        # macOS sed
+        sed -i '' "s|^OPENROUTER_API_KEY=.*|OPENROUTER_API_KEY=${LLM_KEY}|" .env
+    else
+        # Linux sed
+        sed -i "s|^OPENROUTER_API_KEY=.*|OPENROUTER_API_KEY=${LLM_KEY}|" .env
+    fi
+
+    print_success "LLM key updated in .env file"
+
+    # Stop containers
+    print_info "Stopping containers..."
+    if docker-compose down 2>&1; then
+        print_success "Containers stopped"
+    else
+        print_warning "Failed to stop containers gracefully"
+    fi
+
+    # Recreate containers with force recreate
+    print_info "Recreating containers with new configuration..."
+    if docker-compose up -d --force-recreate 2>&1; then
+        print_success "Containers recreated and started"
+    else
+        print_error "Failed to recreate containers"
+        exit 1
+    fi
+
+    # Wait for health check
+    print_info "Waiting for gateway to be healthy..."
+    local max_attempts=30
+    local attempt=1
+
+    while [[ $attempt -le $max_attempts ]]; do
+        if curl -sf http://localhost:${GATEWAY_PORT}/health &>/dev/null; then
+            print_success "Gateway is healthy and responding"
+            break
+        fi
+
+        echo -n "."
+        sleep 2
+        attempt=$((attempt + 1))
+    done
+
+    if [[ $attempt -gt $max_attempts ]]; then
+        echo ""
+        print_warning "Gateway health check timed out, but containers are running"
+        print_info "Check logs with: cd $DEPLOY_DIR && docker-compose logs -f"
+    fi
+
+    echo ""
+    echo -e "${BOLD}${GREEN}LLM key update completed successfully!${NC}"
+    echo ""
+    echo -e "${BOLD}Updated Configuration:${NC}"
+    echo "  LLM Key:       ${LLM_KEY:0:20}... (truncated)"
+    echo "  Deployment Dir: $DEPLOY_DIR"
+    echo ""
+    echo -e "${BOLD}Next Steps:${NC}"
+    echo "  1. Test LLM functionality with an agent"
+    echo "  2. View logs: cd $DEPLOY_DIR && docker-compose logs -f"
+    echo "  3. Restart if needed: cd $DEPLOY_DIR && docker-compose restart"
+    echo ""
+}
+
+install_wechat_plugin() {
+    print_header
+
+    print_info "Installing WeChat plugin and generating QR code..."
+
+    # Check if deployment directory exists
+    if [[ ! -d "$DEPLOY_DIR" ]]; then
+        print_error "Deployment directory not found: $DEPLOY_DIR"
+        print_info "Have you installed the gateway yet?"
+        exit 1
+    fi
+
+    # Find the gateway container
+    local gateway_container=""
+    local env_file="${DEPLOY_DIR}/.env"
+
+    if [[ -f "$env_file" ]]; then
+        # Extract resource token and get last 4 characters
+        local resource_token
+        resource_token=$(grep "^RESOURCE_TOKEN=" "$env_file" | cut -d'=' -f2)
+        if [[ -n "$resource_token" ]]; then
+            local token_suffix="${resource_token: -4}"
+            gateway_container="clawfarm-gateway-${token_suffix}"
+        fi
+    fi
+
+    # Fallback to pattern matching if exact match fails
+    if [[ -z "$gateway_container" ]] || ! docker ps --format '{{.Names}}' | grep -q "^${gateway_container}$"; then
+        gateway_container=$(docker ps --format '{{.Names}}' | grep -E '^clawfarm-gateway-' | head -1)
+    fi
+
+    if [[ -z "$gateway_container" ]]; then
+        print_error "Gateway container not found"
+        print_info "Make sure the gateway is running: cd $DEPLOY_DIR && docker-compose up -d"
+        exit 1
+    fi
+
+    # Check if gateway is running
+    if ! docker exec "$gateway_container" pwd &>/dev/null; then
+        print_error "Gateway is not running"
+        print_info "Start the gateway: cd $DEPLOY_DIR && docker-compose up -d"
+        exit 1
+    fi
+
+    print_success "Found gateway container: $gateway_container"
+
+    # Install WeChat plugin
+    print_info "Installing WeChat communication plugin..."
+
+    if docker exec "$gateway_container" openclaw plugins install "@tencent-weixin/openclaw-weixin" 2>&1 | grep -q "Installed plugin"; then
+        print_success "WeChat plugin installed successfully"
+    else
+        print_error "WeChat plugin installation failed"
+        print_info "Check gateway logs for more information"
+        exit 1
+    fi
+
+    # Add to plugins.allow list
+    print_info "Configuring plugin permissions..."
+    docker exec "$gateway_container" openclaw config set plugins.allow '["openclaw-weixin","memory-core","openrouter","gemma"]' --json 2>/dev/null || true
+
+    print_success "Plugin permissions configured"
+
+    # Show QR code
+    echo ""
+    echo -e "${BOLD}${BLUE}===========================================${NC}"
+    echo -e "${BOLD}${BLUE}  WeChat QR Code Login${NC}"
+    echo -e "${BOLD}${BLUE}===========================================${NC}"
+    echo ""
+    print_info "Scan this QR code with WeChat to connect:"
+    echo ""
+
+    # Execute the login command and show QR code
+    docker exec "$gateway_container" openclaw channels login --channel openclaw-weixin
+
+    echo ""
+    echo -e "${BOLD}${GREEN}WeChat plugin setup completed!${NC}"
+    echo ""
+    echo -e "${BOLD}Next Steps:${NC}"
+    echo "  1. Open WeChat on your phone"
+    echo "  2. Scan the QR code shown above"
+    echo "  3. Follow the prompts to authorize"
+    echo "  4. Test messaging: docker exec $gateway_container openclaw channels list"
+    echo ""
+    echo -e "${BOLD}Management Commands:${NC}"
+    echo "  View channels:  docker exec $gateway_container openclaw channels list"
+    echo "  Send message:   docker exec $gateway_container openclaw channels send --channel openclaw-weixin 'Hello from CLI'"
+    echo "  View logs:      cd $DEPLOY_DIR && docker-compose logs -f"
     echo ""
 }
 
@@ -1100,6 +1453,17 @@ main() {
 
     # Parse arguments
     parse_arguments "$@"
+
+    # Handle maintenance modes
+    if [[ "$UPDATE_LLM_KEY" == "true" ]]; then
+        update_llm_key_and_recreate
+        exit 0
+    fi
+
+    if [[ "$INSTALL_WECHAT_ONLY" == "true" ]]; then
+        install_wechat_plugin
+        exit 0
+    fi
 
     # Installation steps
     validate_prerequisites
@@ -1122,6 +1486,7 @@ main() {
     if verify_deployment; then
         setup_communication_channels
         setup_built_in_skills
+        setup_browser_service
         setup_autostart_service
         show_summary
         exit 0

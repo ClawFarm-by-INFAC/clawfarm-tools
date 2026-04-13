@@ -376,28 +376,53 @@ remove_launch_agents() {
     fi
 
     local launch_agents_dir="$HOME/Library/LaunchAgents"
-    local plist_file="$launch_agents_dir/com.clawfarm.gateway.plist"
 
-    if [[ -f "$plist_file" ]]; then
+    # Remove gateway LaunchAgent
+    local gateway_plist="$launch_agents_dir/com.clawfarm.gateway.plist"
+    if [[ -f "$gateway_plist" ]]; then
         print_info "Unloading LaunchAgent: com.clawfarm.gateway"
 
         # Try to unload the LaunchAgent
-        if launchctl unload "$plist_file" 2>/dev/null; then
-            print_success "LaunchAgent unloaded"
+        if launchctl unload "$gateway_plist" 2>/dev/null; then
+            print_success "Gateway LaunchAgent unloaded"
         else
-            print_warning "LaunchAgent was not loaded"
+            print_warning "Gateway LaunchAgent was not loaded"
         fi
 
         # Remove the plist file
-        print_info "Removing plist file: $plist_file"
+        print_info "Removing plist file: $gateway_plist"
 
-        if rm -f "$plist_file"; then
-            print_success "LaunchAgent removed"
+        if rm -f "$gateway_plist"; then
+            print_success "Gateway LaunchAgent removed"
         else
-            print_warning "Failed to remove plist file"
+            print_warning "Failed to remove gateway plist file"
         fi
-    else
-        print_info "No LaunchAgent found"
+    fi
+
+    # Remove browser service LaunchAgent
+    local browser_plist="$launch_agents_dir/ca.clawfarm.browser.plist"
+    if [[ -f "$browser_plist" ]]; then
+        print_info "Unloading LaunchAgent: ca.clawfarm.browser"
+
+        # Try to unload the browser LaunchAgent
+        if launchctl unload "$browser_plist" 2>/dev/null; then
+            print_success "Browser service LaunchAgent unloaded"
+        else
+            print_warning "Browser service LaunchAgent was not loaded"
+        fi
+
+        # Remove the plist file
+        print_info "Removing plist file: $browser_plist"
+
+        if rm -f "$browser_plist"; then
+            print_success "Browser service LaunchAgent removed"
+        else
+            print_warning "Failed to remove browser service plist file"
+        fi
+    fi
+
+    if [[ ! -f "$gateway_plist" ]] && [[ ! -f "$browser_plist" ]]; then
+        print_info "No LaunchAgents found"
     fi
 
     print_success "LaunchAgents removed"
@@ -512,6 +537,9 @@ show_summary() {
 
     echo "  ✓ Docker networks"
     echo "  ✓ Auto-start services (LaunchAgent/systemd)"
+    if [[ "$OSTYPE" == darwin* ]]; then
+        echo "  ✓ Browser service (Chrome CDP)"
+    fi
     echo "  ✓ Deployment directory"
 
     if [[ "$KEEP_DATA" == "true" ]]; then
