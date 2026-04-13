@@ -35,6 +35,10 @@ DEPLOYMENT_TYPE="local"
 DEFAULT_LLM_MODEL="google/gemma-4-26b-a4b-it"
 SKIP_TOKEN_VALIDATION=false
 
+DOCKER_REGISTRY_USERNAME="openclaw-readonly"
+DOCKER_REGISTRY_PASSWORD=""
+SKIP_DOCKER_LOGIN=false
+
 # Command line arguments
 RESOURCE_TOKEN=""
 AGENCY_ID=""
@@ -115,6 +119,14 @@ parse_arguments() {
                 DEFAULT_LLM_MODEL="$2"
                 shift 2
                 ;;
+            --registry-password)
+                DOCKER_REGISTRY_PASSWORD="$2"
+                shift 2
+                ;;
+            --skip-docker-login)
+                SKIP_DOCKER_LOGIN=true
+                shift
+                ;;
             --type)
                 DEPLOYMENT_TYPE="$2"
                 shift 2
@@ -175,6 +187,7 @@ Options:
   --resource-name NAME         Gateway resource name (default: <user>-<hostname>)
   --llm-key KEY                LLM API key from OpenRouter (recommended for agents)
   --llm-model MODEL            Default LLM model (default: google/gemma-4-26b-a4b-it)
+  --registry-password PASS     Docker registry password for authentication
   --type TYPE                  Deployment type: local|cloud (default: local)
   --port PORT                  Gateway port (default: 8080)
   --dir DIR                    Installation directory (default: ~/openclaw-gateway)
@@ -184,6 +197,7 @@ Options:
   --verbose, -v                Enable verbose output
   --dry-run, -d                Show what would be done without executing
   --skip-token-validation      Skip Control Plane token validation
+  --skip-docker-login          Skip Docker registry login
   --help, -h                   Show this help message
 
 Example:
@@ -681,9 +695,41 @@ EOF
     print_success "Configuration files generated"
 }
 
-pull_docker_image() {
-    print_step 5 "Pulling Docker image"
+docker_registry_login() {
+    print_step 5 "Authenticating with Docker registry"
     show_progress 5 10
+
+    # Skip if registry password not provided or explicitly skipped
+    if [[ -z "$DOCKER_REGISTRY_PASSWORD" ]] || [[ "$SKIP_DOCKER_LOGIN" == "true" ]]; then
+        print_info "Docker registry authentication skipped (public images or --skip-docker-login)"
+        return 0
+    fi
+
+    # Check if already logged in to the registry
+    if docker info 2>/dev/null | grep -q "Username: ${DOCKER_REGISTRY_USERNAME}"; then
+        print_success "Already authenticated with Docker registry"
+        return 0
+    fi
+
+    print_info "Authenticating with Azure Container Registry..."
+
+    # Extract registry from REGISTRY variable
+    local registry="${REGISTRY}"
+
+    # Perform Docker login
+    if echo "$DOCKER_REGISTRY_PASSWORD" | docker login -u "$DOCKER_REGISTRY_USERNAME" --password-stdin "$registry" 2>&1; then
+        print_success "Docker registry authentication successful"
+        return 0
+    else
+        print_error "Docker registry authentication failed"
+        print_info "You can skip authentication with --skip-docker-login"
+        return 1
+    fi
+}
+
+pull_docker_image() {
+    print_step 6 "Pulling Docker image"
+    show_progress 6 10
 
     cd "$DEPLOY_DIR"
     if ! docker-compose pull 2>&1; then
@@ -695,8 +741,8 @@ pull_docker_image() {
 }
 
 start_gateway() {
-    print_step 6 "Starting gateway"
-    show_progress 6 10
+    print_step 7 "Starting gateway"
+    show_progress 7 10
 
     cd "$DEPLOY_DIR"
     if ! docker-compose up -d 2>&1; then
@@ -708,8 +754,8 @@ start_gateway() {
 }
 
 verify_deployment() {
-    print_step 7 "Verifying deployment"
-    show_progress 7 10
+    print_step 8 "Verifying deployment"
+    show_progress 8 10
 
     # Wait for health check
     local max_attempts=30
@@ -733,8 +779,8 @@ verify_deployment() {
 }
 
 setup_communication_channels() {
-    print_step 8 "Setting up communication channels"
-    show_progress 8 13
+    print_step 9 "Setting up communication channels"
+    show_progress 9 13
 
     if [[ "$DRY_RUN" == "true" ]]; then
         print_success "Communication channels configured (dry run)"
@@ -799,8 +845,8 @@ setup_communication_channels() {
 }
 
 setup_built_in_skills() {
-    print_step 9 "Setting up built-in skills"
-    show_progress 9 13
+    print_step 10 "Setting up built-in skills"
+    show_progress 10 13
 
     if [[ "$DRY_RUN" == "true" ]]; then
         print_success "Built-in skills configured (dry run)"
@@ -916,8 +962,8 @@ setup_built_in_skills() {
 }
 
 setup_autostart_service() {
-    print_step 10 "Setting up auto-start service"
-    show_progress 10 13
+    print_step 11 "Setting up auto-start service"
+    show_progress 11 13
 
     # Only setup autostart for macOS local deployments
     if [[ "$OSTYPE" == darwin* ]] && [[ "$DEPLOYMENT_TYPE" == "local" ]]; then
@@ -1009,8 +1055,8 @@ get_gateway_token() {
 }
 
 show_summary() {
-    print_step 11 "Installation summary"
-    show_progress 11 13
+    print_step 12 "Installation summary"
+    show_progress 12 13
 
     echo ""
     echo -e "${BOLD}${GREEN}Installation completed successfully!${NC}"
@@ -1080,6 +1126,7 @@ main() {
 
     create_deployment_directory
     generate_configuration_files
+    docker_registry_login
     pull_docker_image
     start_gateway
 
