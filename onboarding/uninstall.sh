@@ -220,7 +220,7 @@ stop_and_remove_containers() {
     fi
 
     # Manual container removal as fallback
-    local containers_to_remove=()
+    local -a containers_to_remove=()
 
     # Add gateway container if detected
     if [[ -n "$GATEWAY_NAME" ]] && docker ps -a --format '{{.Names}}' | grep -q "^${GATEWAY_NAME}$"; then
@@ -279,7 +279,7 @@ remove_docker_volumes() {
     fi
 
     # Manual volume removal for named volumes
-    local volumes_to_remove=(
+    local -a volumes_to_remove=(
         "openclaw-workspace"
         "openclaw-logs"
     )
