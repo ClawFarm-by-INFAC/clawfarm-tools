@@ -377,55 +377,72 @@ remove_launch_agents() {
 
     local launch_agents_dir="$HOME/Library/LaunchAgents"
 
-    # Remove gateway LaunchAgent
-    local gateway_plist="$launch_agents_dir/com.clawfarm.gateway.plist"
-    if [[ -f "$gateway_plist" ]]; then
-        print_info "Unloading LaunchAgent: com.clawfarm.gateway"
+    # Array of all possible clawfarm LaunchAgent identifiers
+    local -a launch_agent_ids=(
+        "com.clawfarm.gateway"
+        "ca.clawfarm.browser"
+        "ca.clawfarm.daemon"
+    )
 
-        # Try to unload the LaunchAgent
-        if launchctl unload "$gateway_plist" 2>/dev/null; then
-            print_success "Gateway LaunchAgent unloaded"
-        else
-            print_warning "Gateway LaunchAgent was not loaded"
+    local removed_count=0
+
+    # Try to unload and remove each known LaunchAgent
+    for agent_id in "${launch_agent_ids[@]:-}"; do
+        local plist_file="$launch_agents_dir/${agent_id}.plist"
+
+        if [[ -f "$plist_file" ]]; then
+            print_info "Found LaunchAgent: $agent_id"
+
+            # Try to unload the LaunchAgent using both methods
+            if launchctl unload "$plist_file" 2>/dev/null; then
+                print_success "Unloaded: $agent_id"
+            elif launchctl bootout "gui/$(id -u)/${agent_id}" 2>/dev/null; then
+                print_success "Booted out: $agent_id"
+            else
+                print_warning "$agent_id was not loaded"
+            fi
+
+            # Remove the plist file
+            if rm -f "$plist_file"; then
+                print_success "Removed plist: $plist_file"
+                removed_count=$((removed_count + 1))
+            else
+                print_warning "Failed to remove plist: $plist_file"
+            fi
         fi
+    done
 
-        # Remove the plist file
-        print_info "Removing plist file: $gateway_plist"
+    # Also scan for any other clawfarm plist files that might exist
+    if [[ -d "$launch_agents_dir" ]]; then
+        local -a additional_plists
+        additional_plists=($(find "$launch_agents_dir" -name "*clawfarm*.plist" -o -name "*ca.clawfarm*.plist" 2>/dev/null))
 
-        if rm -f "$gateway_plist"; then
-            print_success "Gateway LaunchAgent removed"
-        else
-            print_warning "Failed to remove gateway plist file"
-        fi
+        for plist_file in "${additional_plists[@]:-}"; do
+            if [[ -f "$plist_file" ]]; then
+                print_info "Found additional clawfarm plist: $(basename "$plist_file")"
+
+                # Extract the agent ID (filename without .plist extension)
+                local agent_id=$(basename "$plist_file" .plist)
+
+                # Try to unload
+                launchctl unload "$plist_file" 2>/dev/null || launchctl bootout "gui/$(id -u)/${agent_id}" 2>/dev/null || true
+
+                # Remove the file
+                if rm -f "$plist_file"; then
+                    print_success "Removed additional plist: $plist_file"
+                    removed_count=$((removed_count + 1))
+                fi
+            fi
+        done
     fi
 
-    # Remove browser service LaunchAgent
-    local browser_plist="$launch_agents_dir/ca.clawfarm.browser.plist"
-    if [[ -f "$browser_plist" ]]; then
-        print_info "Unloading LaunchAgent: ca.clawfarm.browser"
-
-        # Try to unload the browser LaunchAgent
-        if launchctl unload "$browser_plist" 2>/dev/null; then
-            print_success "Browser service LaunchAgent unloaded"
-        else
-            print_warning "Browser service LaunchAgent was not loaded"
-        fi
-
-        # Remove the plist file
-        print_info "Removing plist file: $browser_plist"
-
-        if rm -f "$browser_plist"; then
-            print_success "Browser service LaunchAgent removed"
-        else
-            print_warning "Failed to remove browser service plist file"
-        fi
+    if [[ $removed_count -eq 0 ]]; then
+        print_info "No clawfarm LaunchAgents found to remove"
+    else
+        print_success "Removed $removed_count LaunchAgent(s)"
     fi
 
-    if [[ ! -f "$gateway_plist" ]] && [[ ! -f "$browser_plist" ]]; then
-        print_info "No LaunchAgents found"
-    fi
-
-    print_success "LaunchAgents removed"
+    print_success "LaunchAgents cleanup completed"
 }
 
 remove_systemd_services() {

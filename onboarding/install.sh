@@ -49,6 +49,7 @@ VERBOSE=false
 DRY_RUN=false
 UPDATE_LLM_KEY=false
 INSTALL_WECHAT_ONLY=false
+INCLUDE_WECHAT=false
 
 ##############################################################################
 # UTILITY FUNCTIONS
@@ -170,8 +171,12 @@ parse_arguments() {
                 UPDATE_LLM_KEY=true
                 shift
                 ;;
-            --install-wechat)
+            --install-wechat-only)
                 INSTALL_WECHAT_ONLY=true
+                shift
+                ;;
+            --with-wechat)
+                INCLUDE_WECHAT=true
                 shift
                 ;;
             --help|-h)
@@ -204,7 +209,8 @@ Options:
   --registry REGISTRY          Container registry (default: clawfarmacrproduction.azurecr.io)
   --tag TAG                    Image tag (default: latest)
   --update-llm-key             Update LLM key and force recreate containers
-  --install-wechat             Install WeChat plugin and show QR code (requires running gateway)
+  --install-wechat-only        Install WeChat plugin only on existing gateway (requires running gateway)
+  --with-wechat                Include WeChat plugin installation during setup
   --yes, -y                    Skip confirmation prompts
   --verbose, -v                Enable verbose output
   --dry-run, -d                Show what would be done without executing
@@ -227,7 +233,14 @@ Examples:
 
   # Install WeChat plugin on running gateway
   $0 --dir ~/openclaw-gateway \\
-      --install-wechat --yes
+      --install-wechat-only --yes
+
+  # Full installation with WeChat plugin
+  $0 --type local \\
+      --resource-token YOUR-TOKEN \\
+      --agency-id YOUR-AGENCY-ID \\
+      --resource-name my-gateway \\
+      --with-wechat --yes
 
 For more information, visit: https://docs.clawfarm.ca/installation
 USAGE
@@ -797,6 +810,14 @@ setup_communication_channels() {
         return 0
     fi
 
+    # Skip WeChat installation by default unless explicitly requested
+    if [[ "$INCLUDE_WECHAT" != "true" ]]; then
+        print_info "WeChat plugin installation skipped (use --with-wechat to enable)"
+        print_info "You can install WeChat later using: ./install.sh --install-wechat-only"
+        print_success "Communication channels configured"
+        return 0
+    fi
+
     # Find the gateway container
     local gateway_container=""
     local env_file="${DEPLOY_DIR}/.env"
@@ -1069,23 +1090,36 @@ setup_browser_service() {
 </plist>
 EOF
 
-        # Load the browser service LaunchAgent
+        # First unload any existing browser service to avoid conflicts
+        if launchctl list | grep -q "${browser_service_label}"; then
+            print_info "Unloading existing browser service..."
+            launchctl unload "$plist_file" 2>/dev/null || true
+            launchctl bootout "gui/$(id -u)/${browser_service_label}" 2>/dev/null || true
+            sleep 1
+        fi
+
+        # Load the browser service LaunchAgent using modern method
+        print_info "Loading browser service LaunchAgent..."
         if launchctl load "$plist_file" 2>/dev/null; then
             print_success "Chrome CDP service loaded successfully"
             print_info "Browser service will start automatically on login"
+
+            # Force start the service immediately
+            launchctl start "${browser_service_label}" 2>/dev/null || true
         else
             print_warning "Failed to load Chrome CDP service"
             print_info "You can manually load it later with: launchctl load $plist_file"
         fi
 
         # Give Chrome a moment to start
-        sleep 2
+        sleep 3
 
         # Verify Chrome CDP is accessible
         if curl -sf "http://localhost:${chrome_cdp_port}/json/version" > /dev/null 2>&1; then
             print_success "Chrome CDP is accessible on port ${chrome_cdp_port}"
         else
             print_warning "Chrome CDP not yet accessible on port ${chrome_cdp_port} (may still be starting)"
+            print_info "Check status with: launchctl list | grep clawfarm"
         fi
 
     else
@@ -1146,10 +1180,25 @@ setup_autostart_service() {
 </plist>
 EOF
 
-        # Load the LaunchAgent
+        # First unload any existing gateway service to avoid conflicts
+        local gateway_service_label="com.clawfarm.gateway"
+        if launchctl list | grep -q "${gateway_service_label}"; then
+            print_info "Unloading existing gateway service..."
+            launchctl unload "$plist_file" 2>/dev/null || true
+            launchctl bootout "gui/$(id -u)/${gateway_service_label}" 2>/dev/null || true
+            sleep 1
+        fi
+
+        # Load the LaunchAgent using modern method
+        print_info "Loading gateway LaunchAgent..."
         if launchctl load "$plist_file" 2>/dev/null; then
             print_success "Gateway LaunchAgent loaded successfully"
             print_info "Gateway will start automatically on login"
+
+            # Verify the LaunchAgent is loaded
+            if launchctl list | grep -q "${gateway_service_label}"; then
+                print_success "Gateway service is registered and will auto-start"
+            fi
         else
             print_warning "Failed to load gateway LaunchAgent"
             print_info "You can manually load it later with: launchctl load $plist_file"
@@ -1189,11 +1238,52 @@ get_gateway_token() {
     echo "$token"
 }
 
+verify_launchagents() {
+    # Only verify on macOS
+    if [[ "$OSTYPE" != darwin* ]]; then
+        return 0
+    fi
+
+    print_info "Verifying LaunchAgent registration..."
+
+    local -a launch_agent_ids=(
+        "com.clawfarm.gateway"
+        "ca.clawfarm.browser"
+    )
+
+    local registered_count=0
+    local total_count=${#launch_agent_ids[@]}
+
+    for agent_id in "${launch_agent_ids[@]:-}"; do
+        if launchctl list | grep -q "${agent_id}"; then
+            print_success "✓ ${agent_id} is registered"
+            registered_count=$((registered_count + 1))
+        else
+            print_warning "✗ ${agent_id} is not registered"
+        fi
+    done
+
+    if [[ $registered_count -eq $total_count ]]; then
+        print_success "All LaunchAgents are registered successfully"
+        return 0
+    else
+        print_warning "Some LaunchAgents are not registered (${registered_count}/${total_count})"
+        return 1
+    fi
+}
+
 show_summary() {
     print_step 13 "Installation summary"
     show_progress 13 13
 
     echo ""
+
+    # Verify LaunchAgents on macOS
+    if [[ "$OSTYPE" == darwin* ]]; then
+        verify_launchagents
+        echo ""
+    fi
+
     echo -e "${BOLD}${GREEN}Installation completed successfully!${NC}"
     echo ""
     echo -e "${BOLD}Gateway Details:${NC}"
