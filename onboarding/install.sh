@@ -931,14 +931,22 @@ setup_built_in_skills() {
     docker exec "$gateway_container" mkdir -p /workspace/skills/ 2>/dev/null
 
     # List all directories in the skills source directory (portable method)
+    print_info "Checking for built-in skills..."
+
+    # Use timeout to prevent hanging
     local skills_list
-    skills_list=$(docker exec "$gateway_container" find /usr/local/share/openclaw/skills -mindepth 1 -maxdepth 1 -type d 2>/dev/null | while read -r skill_path; do basename "$skill_path"; done)
+    skills_list=$(timeout 10 docker exec "$gateway_container" find /usr/local/share/openclaw/skills -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null) || {
+        print_warning "Skills setup timed out or failed - skipping"
+        return 0
+    }
 
     if [[ -z "$skills_list" ]]; then
         print_warning "No skills found in /usr/local/share/openclaw/skills"
         print_info "Agents can still use plugins and external skills"
         return 0
     fi
+
+    print_info "Found skills: $skills_list"
 
     # Copy all skills from built-in location to workspace
     local skills_copied=0
@@ -947,9 +955,10 @@ setup_built_in_skills() {
 
     print_info "Found built-in skills, copying to workspace..."
 
-    while IFS= read -r skill_name; do
+    # Use a for loop instead of while read for better reliability
+    for skill_name in $skills_list; do
         if [[ -n "$skill_name" ]]; then
-            if docker exec "$gateway_container" cp -r "/usr/local/share/openclaw/skills/${skill_name}" "/workspace/skills/" 2>/dev/null; then
+            if timeout 10 docker exec "$gateway_container" cp -r "/usr/local/share/openclaw/skills/${skill_name}" "/workspace/skills/" 2>/dev/null; then
                 skills_copied=$((skills_copied + 1))
                 print_info "✓ Copied: $skill_name"
 
@@ -964,7 +973,7 @@ setup_built_in_skills() {
                 print_warning "✗ Failed to copy: $skill_name"
             fi
         fi
-    done <<< "$skills_list"
+    done
 
     # Report results
     if [[ $skills_copied -gt 0 ]]; then
@@ -985,7 +994,7 @@ setup_built_in_skills() {
     # Show individual skills if any were copied
     if [[ $skills_copied -gt 0 ]]; then
         echo "Available Skills:"
-        docker exec "$gateway_container" find /workspace/skills -mindepth 1 -maxdepth 1 -type d 2>/dev/null | while read -r skill_path; do basename "$skill_path"; done | sort | sed 's/^/  - /'
+        docker exec "$gateway_container" find /workspace/skills -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | sort | sed 's/^/  - /'
         echo ""
     fi
 
