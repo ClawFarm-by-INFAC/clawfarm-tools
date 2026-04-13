@@ -233,7 +233,7 @@ stop_and_remove_containers() {
     fi
 
     # Remove any detected containers
-    for container in "${containers_to_remove[@]}"; do
+    for container in "${containers_to_remove[@]:-}"; do
         print_info "Removing container: $container"
 
         if docker stop "$container" 2>/dev/null; then
@@ -284,7 +284,7 @@ remove_docker_volumes() {
         "openclaw-logs"
     )
 
-    for volume in "${volumes_to_remove[@]}"; do
+    for volume in "${volumes_to_remove[@]:-}"; do
         if docker volume ls -q | grep -q "^${volume}$"; then
             print_info "Removing volume: $volume"
 
