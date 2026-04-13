@@ -896,12 +896,24 @@ setup_built_in_skills() {
 
     print_info "Copying built-in skills to workspace..."
 
+    # Get gateway name from .env file
+    local gateway_name=""
+    if [[ -f "$DEPLOY_DIR/.env" ]]; then
+        gateway_name=$(grep "^GATEWAY_NAME=" "$DEPLOY_DIR/.env" | cut -d'=' -f2)
+    fi
+
+    if [[ -z "$gateway_name" ]]; then
+        print_warning "Could not determine gateway name, skipping skills setup"
+        print_info "You can manually copy skills later"
+        return 0
+    fi
+
     # Copy skills from bundled location to workspace
     local bundled_skills_dir="/usr/local/share/openclaw/skills"
     local workspace_skills_dir="/workspace/skills"
 
     # First, create the skills directory in workspace if it doesn't exist
-    docker exec "${GATEWAY_NAME}" mkdir -p "$workspace_skills_dir" 2>/dev/null || true
+    docker exec "${gateway_name}" mkdir -p "$workspace_skills_dir" 2>/dev/null || true
 
     # Copy each skill directory from bundled location to workspace
     local skills_copied=0
@@ -910,11 +922,11 @@ setup_built_in_skills() {
     # Get list of skill directories (skip markdown files and non-directories)
     # Try GNU find first, fallback to BSD/macOS find
     local skill_dirs
-    skill_dirs=$(docker exec "${GATEWAY_NAME}" find "$bundled_skills_dir" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" 2>/dev/null)
+    skill_dirs=$(docker exec "${gateway_name}" find "$bundled_skills_dir" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" 2>/dev/null)
 
     if [[ -z "$skill_dirs" ]]; then
         # Fallback for BSD/macOS find
-        skill_dirs=$(docker exec "${GATEWAY_NAME}" find "$bundled_skills_dir" -mindepth 1 -maxdepth 1 -type d | while read -r dir; do basename "$dir"; done)
+        skill_dirs=$(docker exec "${gateway_name}" find "$bundled_skills_dir" -mindepth 1 -maxdepth 1 -type d | while read -r dir; do basename "$dir"; done)
     fi
 
     if [[ -z "$skill_dirs" ]]; then
@@ -929,7 +941,7 @@ setup_built_in_skills() {
         if [[ -n "$skill_name" ]]; then
             print_info "Copying skill: $skill_name"
 
-            if docker exec "${GATEWAY_NAME}" cp -rf "$bundled_skills_dir/$skill_name" "$workspace_skills_dir/" 2>/dev/null; then
+            if docker exec "${gateway_name}" cp -rf "$bundled_skills_dir/$skill_name" "$workspace_skills_dir/" 2>/dev/null; then
                 print_success "Copied: $skill_name"
                 skills_copied=$((skills_copied + 1))
             else
@@ -942,7 +954,7 @@ setup_built_in_skills() {
     # Set proper permissions
     if [[ $skills_copied -gt 0 ]]; then
         print_info "Setting permissions on skills directory..."
-        docker exec "${GATEWAY_NAME}" chown -R openclaw:openclaw "$workspace_skills_dir" 2>/dev/null || true
+        docker exec "${gateway_name}" chown -R openclaw:openclaw "$workspace_skills_dir" 2>/dev/null || true
     fi
 
     # Summary
