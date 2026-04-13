@@ -83,7 +83,8 @@ print_info() {
 print_step() {
     local step_num="$1"
     local step_name="$2"
-    echo -e "${BOLD}[$step_num/10] $step_name${NC}"
+    local total_steps="${3:-13}"
+    echo -e "${BOLD}[$step_num/$total_steps] $step_name${NC}"
 }
 
 show_progress() {
