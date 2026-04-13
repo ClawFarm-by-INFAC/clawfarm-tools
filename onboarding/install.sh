@@ -91,6 +91,9 @@ show_progress() {
 
 parse_arguments() {
     while [[ $# -gt 0 ]]; do
+        # Skip empty arguments
+        [[ -z "$1" ]] && { shift; continue; }
+
         case $1 in
             --resource-token)
                 RESOURCE_TOKEN="$2"
