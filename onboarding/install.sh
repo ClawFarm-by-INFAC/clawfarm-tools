@@ -374,54 +374,42 @@ generate_openclaw_state_config() {
     local gateway_token
     gateway_token=$(openssl rand -hex 32 2>/dev/null || echo "gateway-token-$(date +%s)-${RANDOM}")
 
-    # Create openclaw.json with gateway configuration
+    # Create openclaw.json with correct gateway configuration schema
     cat > "${openclaw_dir}/openclaw.json" <<EOF
 {
-  "version": "1.0.0",
   "gateway": {
-    "id": "${RESOURCE_NAME}",
-    "name": "${RESOURCE_NAME}",
     "port": ${gateway_port},
+    "bind": "lan",
     "auth": {
-      "token": "${gateway_token}",
-      "type": "bearer"
+      "mode": "token",
+      "token": "${gateway_token}"
     },
-    "capabilities": ["llm", "channels", "skills", "browser"],
-    "version": "1.0.0"
-  },
-  "llm": {
-    "default_model": "${default_llm_model}",
-    "provider": "openrouter",
-    "api_key": "${LLM_KEY:-}",
-    "fallback_models": [
-      "qwen/qwen-2.5-plus",
-      "meta-llama/llama-3.1-8b-instruct"
-    ]
-  },
-  "control_plane": {
-    "api_url": "${CONTROL_PLANE_API_URL:-https://api.clawfarm.ca}",
-    "resource_token": "${RESOURCE_TOKEN}",
-    "agency_id": "${AGENCY_ID}"
-  },
-  "channels": {
-    "enabled": ["openclaw-weixin"],
-    "plugins": {
-      "openclaw-weixin": {
-        "auto_login": false
-      }
+    "controlUi": {
+      "allowedOrigins": [
+        "http://localhost:${gateway_port}",
+        "http://127.0.0.1:${gateway_port}",
+        "http://localhost:18789",
+        "http://127.0.0.1:18789"
+      ]
     }
   },
-  "skills": {
-    "workspace_dir": "/workspace/skills",
-    "auto_load": true,
-    "built_in_skills": [
-      "Agent-Browser-CLI"
+  "agents": {
+    "list": [
+      {
+        "id": "main",
+        "model": "openrouter/${default_llm_model}"
+      }
     ]
   },
-  "browser": {
-    "cdp_proxy_url": "http://clawfarm-browser-proxy:9223",
-    "enabled": true,
-    "headless": true
+  "plugins": {
+    "entries": {
+      "openrouter": {
+        "enabled": true
+      },
+      "browser": {
+        "enabled": false
+      }
+    }
   }
 }
 EOF
