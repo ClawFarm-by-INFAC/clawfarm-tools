@@ -911,7 +911,7 @@ setup_built_in_skills() {
 
     # Copy skills from bundled location to workspace
     local bundled_skills_dir="/usr/local/share/openclaw/skills"
-    local target_dir="/home/node/.openclaw/skills"
+    local target_dir="/home/openclaw/.openclaw/skills"
 
     # Copy the entire skills directory (run as node user for permissions)
     print_info "Copying skills directory..."
