@@ -766,7 +766,13 @@ pull_docker_image() {
     show_progress 6 10
 
     cd "$DEPLOY_DIR"
-    if ! docker-compose pull 2>&1; then
+
+    # Explicitly pull the image to ensure we get the latest version
+    # This forces Docker to check the registry for updates
+    local image_name="${REGISTRY}/openclaw-gateway${IMAGE_TAG_SEPARATOR}${IMAGE_TAG}"
+    print_info "Pulling image: $image_name"
+
+    if ! docker pull "$image_name" 2>&1; then
         print_error "Failed to pull Docker image"
         return 1
     fi
