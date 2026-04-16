@@ -1500,24 +1500,19 @@ install_wechat_plugin() {
 
     # First check if plugin is already installed
     local plugin_check
-    plugin_check=$(timeout 5 docker exec "$gateway_container" openclaw plugins list 2>/dev/null | grep -i "openclaw-weixin" || true)
+    plugin_check=$(docker exec "$gateway_container" openclaw plugins list 2>/dev/null | grep -i "openclaw-weixin" || true)
 
     if [[ -n "$plugin_check" ]]; then
         print_success "WeChat plugin already installed"
     else
-        # Try to install with timeout to prevent hanging
+        # Try to install plugin
         local install_output
-        install_output=$(timeout 30 docker exec "$gateway_container" openclaw plugins install "@tencent-weixin/openclaw-weixin" 2>&1 || echo "TIMEOUT")
+        install_output=$(docker exec "$gateway_container" openclaw plugins install "@tencent-weixin/openclaw-weixin" 2>&1)
 
         if echo "$install_output" | grep -q "Installed plugin"; then
             print_success "WeChat plugin installed successfully"
         elif echo "$install_output" | grep -q "plugin already exists"; then
             print_success "WeChat plugin already installed"
-        elif echo "$install_output" == "TIMEOUT"; then
-            print_warning "WeChat plugin installation timed out"
-            print_info "The plugin installation may be in progress or hung"
-            print_info "Please check manually with: docker exec $gateway_container openclaw plugins list"
-            exit 1
         else
             print_error "WeChat plugin installation failed"
             print_info "Error output:"
