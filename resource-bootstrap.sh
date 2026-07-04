@@ -87,10 +87,8 @@ _redact() {
     for key in "${REDACT_KEYS[@]}"; do
         val="${!key:-}"
         if [[ -n "$val" ]]; then
-            # Escape special chars in val for bash string replacement.
-            local escaped_val
-            escaped_val="${val//\\/\\\\}"
-            escaped_val="${escaped_val//&/\\&}"
+            # Bash ${var//pat/x} performs literal matching when pat is quoted,
+            # so no escaping of $val is needed here.
             msg="${msg//"$val"/********}"
         fi
     done
