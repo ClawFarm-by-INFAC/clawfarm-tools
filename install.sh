@@ -5,8 +5,8 @@
 #   install.sh:  /home/ambling/Projects/ClawFarm/scripts/deploy/install.sh
 #   lib dir:     /home/ambling/Projects/ClawFarm/scripts/deploy/lib
 #   template dir: /home/ambling/Projects/ClawFarm/scripts/deploy/templates
-# Bundler path:  scripts/deploy/bundle-install-sh.sh
-# Generated:     2026-07-03T20:22:23Z
+# Bundler path:  /home/ambling/Projects/ClawFarm/scripts/deploy/bundle-install-sh.sh
+# Generated:     2026-07-04T15:08:18Z
 BUNDLED_VERSION="v2.10.2-install-1"
 # =============================================================================
 
