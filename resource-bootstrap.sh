@@ -45,7 +45,7 @@ set -euo pipefail
 # Constants — bumped per release; sync with resource-agent/pyproject.toml
 # version field. NOT env-overridable per design Q1.
 # ---------------------------------------------------------------------------
-RESOURCE_AGENT_TAG="v0.2.3"
+RESOURCE_AGENT_TAG="0.2.3"
 
 # Default image registry — overridable via env var of the same name.
 RESOURCE_AGENT_IMAGE="${RESOURCE_AGENT_IMAGE:-clawfarmacrproduction.azurecr.io/resource-agent}"
