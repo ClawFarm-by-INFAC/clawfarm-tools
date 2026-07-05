@@ -289,9 +289,42 @@ install_docker() {
 
 # Ensures the calling user is in the docker group. Returns 0 on success or
 # if membership already present. Exit 4 on usermod failure.
-# Body filled in by Task A3.
+#
+# Order constraint: MUST run after install_docker — the docker group is
+# created by Docker's installer. On systems without Docker yet, getent group
+# docker would fail spuriously.
+#
+# Sets USER_ADDED_TO_GROUP=1 when membership was actually added (vs. already
+# present) so main can print the "log out + back in" reminder only on the
+# runs that need it.
+USER_ADDED_TO_GROUP=0
 ensure_docker_group() {
-    return 0
+    # Verify the docker group exists (created by Docker's installer).
+    if ! getent group docker >/dev/null 2>&1; then
+        log_error "The 'docker' group does not exist on this system."
+        log_error "This usually means Docker is not installed correctly."
+        log_error "See runbook: ${RUNBOOK_URL}"
+        exit 4
+    fi
+
+    # Check membership: id -nG lists the user's group names.
+    if id -nG "$CALLING_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+        log_debug "User '${CALLING_USER}' is already in the docker group."
+        return 0
+    fi
+
+    log_info "Adding user '${CALLING_USER}' to the 'docker' group (usermod -aG docker) ..."
+    local usermod_rc=0
+    usermod -aG docker "$CALLING_USER" || usermod_rc=$?
+
+    if [[ "$usermod_rc" -ne 0 ]]; then
+        log_error "Failed to add user '${CALLING_USER}' to the 'docker' group (usermod exit ${usermod_rc})."
+        log_error "See runbook: ${RUNBOOK_URL}"
+        exit 4
+    fi
+
+    USER_ADDED_TO_GROUP=1
+    log_info "User '${CALLING_USER}' added to the 'docker' group."
 }
 
 # Ensures the Docker daemon is running. Returns 0 if already running or
@@ -432,7 +465,20 @@ main() {
         ensure_daemon_running
     fi
 
-    log_info "VPS init complete. Next: log out + back in (or 'newgrp docker'), then run resource-bootstrap.sh"
+    log_info "VPS init complete."
+
+    # Print the "log out + back in" reminder only when membership was
+    # actually added during this run (not on no-op runs that only touched
+    # the daemon or install). The user needs to re-login or newgrp for the
+    # group change to take effect in their shell sessions.
+    if [[ "${USER_ADDED_TO_GROUP:-0}" == "1" ]]; then
+        log_warn "User '${CALLING_USER}' was added to the docker group."
+        log_warn "To activate the group in your current shell without logging out:"
+        log_warn "  newgrp docker"
+        log_warn "Or log out completely and back in, then run resource-bootstrap.sh."
+    else
+        log_info "Next: run resource-bootstrap.sh"
+    fi
 }
 
 main "$@"
