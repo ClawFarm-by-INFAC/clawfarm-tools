@@ -2,8 +2,19 @@
 # =============================================================================
 # resource-bootstrap.sh — ClawFarm Resource-Agent Installer
 # =============================================================================
-# Installs the ClawFarm resource-agent daemon on a Linux VPS. The script is
-# designed to be curl-pipe-bash compatible:
+# Installs the ClawFarm resource-agent daemon on a Linux VPS. Designed for
+# no-sudo execution: the script installs everything under $HOME (XDG-style
+# paths) and supervises the container via Docker's built-in
+# --restart=unless-stopped policy. Optional systemd supervision is
+# documented separately in docs/ops/resource-agent-systemd.md (operators
+# who specifically want it can convert post-install).
+#
+# The only prerequisite is that the calling user can talk to the Docker
+# daemon (i.e., is in the `docker` group). For a fresh VPS, run
+# vps-init.sh first as root to install Docker + add the user to the
+# group; afterwards this script runs sudo-free.
+#
+# Curl-pipe-bash compatible:
 #
 #   curl -fsSL <url>/resource-bootstrap.sh | \
 #     RESOURCE_ID=<uuid> RESOURCE_TOKEN=<token> \
@@ -17,15 +28,20 @@
 #
 # Optional overrides (env vars):
 #   RESOURCE_AGENT_IMAGE  Docker image name (default: ACR production)
-#   INSTALL_DIR           Install directory (default: /opt/resource-agent)
-#   STATE_DIR             State directory (default: /var/lib/resource-agent)
+#   STATE_DIR             Host-side XDG state directory bound into
+#                         /var/lib/resource-agent inside the container
+#                         (default: $HOME/.local/state/clawfarm/resource-agent)
+#   GATEWAY_DATA_DIR      Host-side XDG gateway-data directory bound into
+#                         /var/lib/clawfarm/gateways inside the container
+#                         (default: $HOME/.local/share/clawfarm/gateways)
+#   ENV_FILE_DIR          Host-side XDG config directory holding agent.env
+#                         (default: $HOME/.config/clawfarm/resource-agent)
 #
 # Flags:
 #   -y, --yes           No-op (script is non-interactive by default)
 #   --interactive       Enable future interactive prompts (no-op today)
 #   --debug             Verbose logging to stderr
 #   --skip-verify       Skip registration verification step
-#   --restart-policy    Force docker-restart path even if systemd is available
 #   -h, --help          Print usage and exit 0
 #
 # Exit codes:
@@ -50,13 +66,15 @@ RESOURCE_AGENT_TAG="0.2.3"
 # Default image registry — overridable via env var of the same name.
 RESOURCE_AGENT_IMAGE="${RESOURCE_AGENT_IMAGE:-clawfarmacrproduction.azurecr.io/resource-agent}"
 
-INSTALL_DIR="${INSTALL_DIR:-/opt/resource-agent}"
-STATE_DIR="${STATE_DIR:-/var/lib/resource-agent}"
-GATEWAY_DATA_DIR="${GATEWAY_DATA_DIR:-/var/lib/clawfarm/gateways}"
-ENV_FILE_DIR="${ENV_FILE_DIR:-/etc/resource-agent}"
+# Host-side XDG layout. These paths are created on the host (no sudo needed)
+# and bind-mounted into the container at /var/lib/* (see install_docker_restart
+# and write_env_file). The container-internal /var/lib/* values are the
+# resource-agent's Pydantic defaults and the gateway-provisioning contract —
+# they MUST stay as-is. Only the host-side location is XDG.
+STATE_DIR="${STATE_DIR:-${HOME}/.local/state/clawfarm/resource-agent}"
+GATEWAY_DATA_DIR="${GATEWAY_DATA_DIR:-${HOME}/.local/share/clawfarm/gateways}"
+ENV_FILE_DIR="${ENV_FILE_DIR:-${HOME}/.config/clawfarm/resource-agent}"
 ENV_FILE="${ENV_FILE_DIR}/agent.env"
-SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
-SYSTEMD_UNIT="${SYSTEMD_UNIT_DIR}/resource-agent.service"
 
 RUNBOOK_URL="https://github.com/ClawFarm-by-INFAC/clawfarm-tools#diagnose"
 REGISTRY_INSTALL_HINT="curl -fsSL https://get.docker.com | sh"
@@ -161,8 +179,12 @@ Required environment variables:
 
 Optional overrides:
   RESOURCE_AGENT_IMAGE  Docker image (default: clawfarmacrproduction.azurecr.io/resource-agent)
-  INSTALL_DIR           Install directory (default: /opt/resource-agent)
-  STATE_DIR             State directory (default: /var/lib/resource-agent)
+  STATE_DIR             Host state directory bound to /var/lib/resource-agent
+                        inside the container (default: $HOME/.local/state/clawfarm/resource-agent)
+  GATEWAY_DATA_DIR      Host gateway data directory bound to /var/lib/clawfarm/gateways
+                        inside the container (default: $HOME/.local/share/clawfarm/gateways)
+  ENV_FILE_DIR          Host config directory holding agent.env
+                        (default: $HOME/.config/clawfarm/resource-agent)
 
 Flags:
   -y, --yes           No-op (script is non-interactive by default)
@@ -535,8 +557,7 @@ verify_registration() {
 ensure_directories() {
     mkdir -p "$GATEWAY_DATA_DIR"
     mkdir -p "$STATE_DIR"
-    mkdir -p "$INSTALL_DIR"
-    log_debug "Ensured directories: ${GATEWAY_DATA_DIR}, ${STATE_DIR}, ${INSTALL_DIR}"
+    log_debug "Ensured directories: ${GATEWAY_DATA_DIR}, ${STATE_DIR}"
 }
 
 # ---------------------------------------------------------------------------
