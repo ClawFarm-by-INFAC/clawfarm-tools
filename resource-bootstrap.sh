@@ -336,13 +336,17 @@ pull_image() {
 }
 
 # ---------------------------------------------------------------------------
-# Check if already bootstrapped (idempotency)
+# Check if already bootstrapped (idempotency).
+#
+# Returns 0 when the env file exists — the host has been bootstrapped at
+# some point. We deliberately do NOT require the container to be running
+# here: a stopped container (e.g. operator ran `docker stop`) should still
+# take the idempotent restart path, NOT fall through to pull_image and
+# discard state. Container-state checks belong in restart_service().
 # ---------------------------------------------------------------------------
-is_already_running() {
+is_already_bootstrapped() {
     if [[ -f "$ENV_FILE" ]]; then
-        if docker ps --filter "name=^resource-agent$" --filter "status=running" --format '{{.Names}}' 2>/dev/null | grep -q "resource-agent"; then
-            return 0
-        fi
+        return 0
     fi
     return 1
 }
@@ -435,14 +439,25 @@ install_supervisor() {
 }
 
 # ---------------------------------------------------------------------------
-# Restart the service (for idempotency path)
+# Restart the service (for idempotency path).
+#
+# Three cases, decided by container state:
+#   1. Container running → `docker restart` (cheapest, preserves state).
+#   2. Container exists but stopped → `docker start` (preserves state,
+#      avoids re-pulling the image).
+#   3. Container absent → fall through to install_supervisor() for a
+#      fresh install.
 # ---------------------------------------------------------------------------
 restart_service() {
     if docker ps --filter "name=^resource-agent$" --filter "status=running" --format '{{.Names}}' 2>/dev/null | grep -q "resource-agent"; then
         docker restart resource-agent >&2
         log_info "Restarted resource-agent container"
+    elif docker ps -a --filter "name=^resource-agent$" --format '{{.Names}}' 2>/dev/null | grep -q "resource-agent"; then
+        # Container present but stopped — start, do NOT re-pull.
+        docker start resource-agent >&2
+        log_info "Started stopped resource-agent container"
     else
-        # Container not running — install fresh.
+        # Container absent — install fresh.
         install_supervisor
     fi
 }
@@ -501,9 +516,15 @@ main() {
 
     detect_docker
 
-    # Idempotency check: if env file exists AND container is running, just restart.
-    if is_already_running; then
-        log_info "Already bootstrapped — restarting service"
+    # Idempotency check: if env file exists, this host has been bootstrapped
+    # before — restart the existing container (don't re-pull the image).
+    # restart_service() handles running / stopped / absent container states.
+    if is_already_bootstrapped; then
+        if docker ps --filter "name=^resource-agent$" --filter "status=running" --format '{{.Names}}' 2>/dev/null | grep -q "resource-agent"; then
+            log_info "Already bootstrapped — restarting service"
+        else
+            log_info "Already bootstrapped — restarting stopped container"
+        fi
         restart_service
         log_info "Bootstrap complete (restarted existing service)."
         exit 0
