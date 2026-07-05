@@ -329,9 +329,69 @@ ensure_docker_group() {
 
 # Ensures the Docker daemon is running. Returns 0 if already running or
 # successfully started. Exit 5 on failure.
-# Body filled in by Task A4.
+#
+# Order in main: install → group → daemon. The daemon-enable step does NOT
+# require the user to be in the docker group (root via sudo can always talk
+# to the daemon); order is for logical clarity. Runs LAST so install +
+# group membership are already in place.
 ensure_daemon_running() {
-    return 0
+    # Fast path: daemon already reachable.
+    if docker info >/dev/null 2>&1; then
+        log_debug "Docker daemon already running."
+        return 0
+    fi
+
+    log_info "Docker daemon not reachable — starting it."
+
+    # Preferred path: systemd (`systemctl enable --now docker` both starts
+    # the daemon AND schedules it to start on boot).
+    if command -v systemctl >/dev/null 2>&1; then
+        log_debug "Using systemctl to enable + start docker."
+        local rc=0
+        systemctl enable --now docker >/dev/null 2>&1 || rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            log_error "Failed to enable + start docker via systemctl (exit ${rc})."
+            log_error "Manual recovery hint: sudo systemctl enable --now docker"
+            log_error "See runbook: ${RUNBOOK_URL}"
+            exit 5
+        fi
+    else
+        # SysV init fallback: `service docker start` starts the daemon but
+        # does NOT schedule on-boot start (operators on SysV hosts must
+        # arrange that themselves via chkconfig or update-rc.d — the runbook
+        # notes this).
+        if command -v service >/dev/null 2>&1; then
+            log_debug "Using 'service docker start' (SysV init fallback)."
+            local rc=0
+            service docker start >/dev/null 2>&1 || rc=$?
+            if [[ "$rc" -ne 0 ]]; then
+                log_error "Failed to start docker via 'service docker start' (exit ${rc})."
+                log_error "Manual recovery hint: sudo service docker start"
+                log_error "See runbook: ${RUNBOOK_URL}"
+                exit 5
+            fi
+            log_warn "Used SysV 'service' fallback. On-boot autostart NOT configured."
+            log_warn "Configure via chkconfig/update-rc.d if your host needs it."
+        else
+            log_error "Docker daemon is not running and no supported init system found."
+            log_error "Neither systemctl nor service is available on PATH."
+            log_error "Start the daemon manually, then re-run vps-init.sh."
+            log_error "See runbook: ${RUNBOOK_URL}"
+            exit 5
+        fi
+    fi
+
+    # Re-verify the daemon came up. The enable/start may report success but
+    # the daemon can still fail to initialize (socket conflicts, storage
+    # driver issues, etc.). `docker info` is the ground truth.
+    if ! docker info >/dev/null 2>&1; then
+        log_error "Docker daemon was started but 'docker info' still fails."
+        log_error "Check daemon logs: journalctl -u docker.service | tail -50"
+        log_error "See runbook: ${RUNBOOK_URL}"
+        exit 5
+    fi
+
+    log_info "Docker daemon is running."
 }
 
 # ---------------------------------------------------------------------------
