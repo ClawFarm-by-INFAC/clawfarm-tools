@@ -202,44 +202,101 @@ detect_calling_user() {
 }
 
 # ---------------------------------------------------------------------------
-# Stub functions — bodies filled in by Tasks A2, A3, A4.
-# Each function returns 0 if its precondition is already satisfied, non-zero
-# if work is needed. The body implementations are intentionally minimal in
-# Task A1 (always report "already satisfied") so the skeleton runs end-to-end
-# before detection logic is added.
+# Docker detection — split into three separate functions per eng review
+# (CRITICAL fix). The original spec wired `detect_docker || install_docker`
+# where detect_docker was `command -v docker && docker info`. That conflates
+# "binary missing" with "daemon stopped" — a stopped daemon would trigger
+# Docker reinstall. These three functions keep the states distinct:
+#   - docker_cli_present:  binary on PATH?
+#   - daemon_running:      daemon reachable + caller has socket permission?
+#   - permission_denied_for_docker: caller lacks docker-group membership?
+# Main wires: `docker_cli_present || install_docker`. After install (or if
+# cli present): `daemon_running || ensure_daemon_running` (NOT reinstall).
 # ---------------------------------------------------------------------------
 
-# Returns 0 if `command -v docker` succeeds.
+# Returns 0 if `command -v docker` succeeds (binary on PATH).
 docker_cli_present() {
+    if command -v docker >/dev/null 2>&1; then
+        log_debug "Docker CLI found on PATH."
+        return 0
+    fi
+    log_debug "Docker CLI not on PATH."
     return 1
 }
 
-# Returns 0 if `docker info` succeeds (daemon reachable + caller has socket
-# permission). Call only after docker_cli_present succeeds.
+# Returns 0 if `docker info` succeeds (daemon reachable AND caller has
+# socket permission). Call only after docker_cli_present returns 0.
 daemon_running() {
+    if docker info >/dev/null 2>&1; then
+        log_debug "Docker daemon is reachable."
+        return 0
+    fi
+    log_debug "Docker daemon is not reachable (down or permission denied)."
     return 1
 }
 
 # Heuristic: returns 0 if `docker info` stderr contains "permission denied"
-# (distinct from "daemon not running"). Used to give a clearer error message.
+# (distinct from "daemon not running"). Useful for clearer error messages
+# when the CLI is present but the caller lacks docker-group membership.
+# Call only after docker_cli_present returns 0.
 permission_denied_for_docker() {
+    local stderr
+    stderr="$(docker info 2>&1 >/dev/null || true)"
+    if echo "$stderr" | grep -qi "permission denied"; then
+        return 0
+    fi
     return 1
 }
 
-# Installs Docker via get.docker.com. Returns 0 on success, exit 3 on failure.
+# Installs Docker via get.docker.com (Docker's official convenience installer).
+# Returns 0 on success. Exit 3 on any failure with the manual-install hint.
+# Idempotent: caller (compute_pending_actions) only invokes this when
+# docker_cli_present() returned non-zero, so we never reinstall an existing
+# Docker.
 install_docker() {
-    log_error "install_docker() not yet implemented."
-    exit 3
+    log_info "Installing Docker via get.docker.com ..."
+
+    # curl-pipe into sh. Pipefail is set, so a non-zero exit from either
+    # curl or sh propagates. We capture the exit code explicitly so the
+    # error message names the failing step.
+    local install_rc=0
+    curl -fsSL https://get.docker.com | sh -s -- >/dev/null 2>&1 || install_rc=$?
+
+    if [[ "$install_rc" -ne 0 ]]; then
+        log_error "Docker install via get.docker.com failed (exit ${install_rc})."
+        log_error "Manual install hint: ${REGISTRY_INSTALL_HINT}"
+        log_error "See runbook: ${RUNBOOK_URL}"
+        exit 3
+    fi
+
+    # Re-verify the install: docker --version must be non-empty.
+    if ! command -v docker >/dev/null 2>&1; then
+        log_error "Docker install reported success but 'docker' is not on PATH."
+        log_error "Manual install hint: ${REGISTRY_INSTALL_HINT}"
+        log_error "See runbook: ${RUNBOOK_URL}"
+        exit 3
+    fi
+
+    local version
+    version="$(docker --version 2>/dev/null || true)"
+    if [[ -z "$version" ]]; then
+        log_error "Docker install reported success but 'docker --version' is empty."
+        exit 3
+    fi
+
+    log_info "Docker installed successfully: ${version}"
 }
 
 # Ensures the calling user is in the docker group. Returns 0 on success or
 # if membership already present. Exit 4 on usermod failure.
+# Body filled in by Task A3.
 ensure_docker_group() {
     return 0
 }
 
 # Ensures the Docker daemon is running. Returns 0 if already running or
 # successfully started. Exit 5 on failure.
+# Body filled in by Task A4.
 ensure_daemon_running() {
     return 0
 }
