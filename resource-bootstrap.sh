@@ -89,7 +89,6 @@ ASSUME_YES=false
 INTERACTIVE=false
 DEBUG=false
 SKIP_VERIFY=false
-FORCE_RESTART_POLICY=false
 
 # ---------------------------------------------------------------------------
 # Logging helpers — all output to stderr with ISO 8601 timestamp + level.
@@ -191,7 +190,6 @@ Flags:
   --interactive       Enable future interactive prompts (no-op today)
   --debug             Verbose logging to stderr
   --skip-verify       Skip registration verification step
-  --restart-policy    Force docker-restart path even if systemd is available
   -h, --help          Print this help and exit 0
 
 Exit codes:
@@ -226,10 +224,6 @@ parse_args() {
                 ;;
             --skip-verify)
                 SKIP_VERIFY=true
-                shift
-                ;;
-            --restart-policy)
-                FORCE_RESTART_POLICY=true
                 shift
                 ;;
             -h|--help)
@@ -304,7 +298,7 @@ detect_docker() {
 
     if ! docker info >/dev/null 2>&1; then
         log_error "Docker daemon is not running."
-        log_error "Start it with: sudo systemctl start docker"
+        log_error "Run vps-init.sh first to install Docker and start the daemon."
         exit 3
     fi
     log_debug "Docker daemon is running."
@@ -403,76 +397,27 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Init system detection
+# Install via docker run --restart=unless-stopped (approach B, no --user flag).
+#
+# Bind-mount path mapping: host XDG paths (${STATE_DIR},
+# ${GATEWAY_DATA_DIR}) are bind-mounted to the agent's container-internal
+# paths (/var/lib/resource-agent, /var/lib/clawfarm/gateways). The
+# container-internal paths are the resource-agent's Pydantic defaults and
+# the gateway-provisioning contract — the entrypoint and Dockerfile both
+# expect /var/lib/* inside the container, so we MUST preserve them on the
+# right-hand side of the bind mount. Only the host-side location is XDG.
+#
+# NO --user flag is passed: the image runs as root, the entrypoint chowns
+# the bind-mounted dirs to UID 1001, then gosu-drops to UID 1001 before
+# exec'ing the agent. Passing `--user $(id -u):$(id -g)` would break both
+# the entrypoint's docker-socket GID fix AND the gateway container's
+# openclaw UID alignment (see entrypoint.sh:57-77, Dockerfile:36-47).
+#
+# NO -e HOME flag: the container's $HOME is irrelevant — the agent reads
+# STATE_DIR/GATEWAY_DATA_DIR from agent.env (hard-coded to /var/lib/*
+# in write_env_file above).
 # ---------------------------------------------------------------------------
-detect_init_system() {
-    if [[ "$FORCE_RESTART_POLICY" == "true" ]]; then
-        log_info "Forced docker-restart path via --restart-policy flag."
-        echo "docker-restart"
-        return
-    fi
-
-    if ! command -v systemctl >/dev/null 2>&1; then
-        log_debug "systemctl not found — using docker-restart fallback."
-        echo "docker-restart"
-        return
-    fi
-
-    local state
-    state="$(systemctl is-system-running 2>/dev/null || echo "unknown")"
-    log_debug "systemctl is-system-running returned: ${state}"
-
-    case "$state" in
-        running|degraded)
-            log_info "Systemd detected (state: ${state}). Will install systemd unit."
-            echo "systemd"
-            ;;
-        *)
-            log_info "Systemd present but not usable (state: ${state}). Falling back to docker-restart."
-            echo "docker-restart"
-            ;;
-    esac
-}
-
-# ---------------------------------------------------------------------------
-# Install systemd unit
-# ---------------------------------------------------------------------------
-install_systemd_unit() {
-    mkdir -p "$SYSTEMD_UNIT_DIR"
-
-    cat > "${SYSTEMD_UNIT_DIR}/resource-agent.service" <<EOF
-[Unit]
-Description=ClawFarm Resource-Agent
-After=docker.service
-Requires=docker.service
-
-[Service]
-Type=simple
-ExecStartPre=-/usr/bin/docker rm -f resource-agent
-ExecStart=/usr/bin/docker run --rm --name resource-agent \\
-  -v /var/run/docker.sock:/var/run/docker.sock \\
-  -v ${GATEWAY_DATA_DIR}:${GATEWAY_DATA_DIR} \\
-  -v ${STATE_DIR}:${STATE_DIR} \\
-  --env-file ${ENV_FILE} \\
-  -p 9091:9091 \\
-  ${RESOURCE_AGENT_IMAGE}:${RESOURCE_AGENT_TAG}
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable --now resource-agent.service
-
-    log_info "Installed and started systemd unit resource-agent.service"
-}
-
-# ---------------------------------------------------------------------------
-# Install via docker run --restart=unless-stopped
-# ---------------------------------------------------------------------------
-install_docker_restart() {
+install_supervisor() {
     # Remove any existing container first.
     docker rm -f resource-agent 2>/dev/null || true
 
@@ -480,8 +425,8 @@ install_docker_restart() {
         --restart=unless-stopped \
         --name resource-agent \
         -v /var/run/docker.sock:/var/run/docker.sock \
-        -v "${GATEWAY_DATA_DIR}:${GATEWAY_DATA_DIR}" \
-        -v "${STATE_DIR}:${STATE_DIR}" \
+        -v "${GATEWAY_DATA_DIR}:/var/lib/clawfarm/gateways" \
+        -v "${STATE_DIR}:/var/lib/resource-agent" \
         --env-file "${ENV_FILE}" \
         -p 9091:9091 \
         "${RESOURCE_AGENT_IMAGE}:${RESOURCE_AGENT_TAG}" >&2
@@ -490,34 +435,10 @@ install_docker_restart() {
 }
 
 # ---------------------------------------------------------------------------
-# Install supervisor (dispatch)
-# ---------------------------------------------------------------------------
-install_supervisor() {
-    local supervisor
-    supervisor="$(detect_init_system)"
-
-    case "$supervisor" in
-        systemd)
-            install_systemd_unit
-            ;;
-        docker-restart)
-            install_docker_restart
-            ;;
-        *)
-            log_error "Unknown supervisor type: ${supervisor}"
-            exit 2
-            ;;
-    esac
-}
-
-# ---------------------------------------------------------------------------
 # Restart the service (for idempotency path)
 # ---------------------------------------------------------------------------
 restart_service() {
-    if systemctl is-active --quiet resource-agent.service 2>/dev/null; then
-        systemctl restart resource-agent.service
-        log_info "Restarted resource-agent.service"
-    elif docker ps --filter "name=^resource-agent$" --filter "status=running" --format '{{.Names}}' 2>/dev/null | grep -q "resource-agent"; then
+    if docker ps --filter "name=^resource-agent$" --filter "status=running" --format '{{.Names}}' 2>/dev/null | grep -q "resource-agent"; then
         docker restart resource-agent >&2
         log_info "Restarted resource-agent container"
     else
