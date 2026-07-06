@@ -6,8 +6,8 @@
 #   lib dir:     /home/ambling/Projects/ClawFarm/scripts/deploy/lib
 #   template dir: /home/ambling/Projects/ClawFarm/scripts/deploy/templates
 # Bundler path:  /home/ambling/Projects/ClawFarm/scripts/deploy/bundle-install-sh.sh
-# Generated:     2026-07-05T04:21:32Z
-BUNDLED_VERSION="v2.10.4-install-0"
+# Generated:     2026-07-06T18:52:35Z
+BUNDLED_VERSION="v2.10.5-install-2"
 # =============================================================================
 
 set -euo pipefail
