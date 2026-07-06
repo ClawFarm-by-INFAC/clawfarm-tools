@@ -64,6 +64,21 @@
 #   7  Required env var is empty (RESOURCE_TOKEN or WEBHOOK_SECRET)
 #   8  CONTROL_PLANE_URL is not http(s)://
 #
+# CHANGES SINCE v2.10.5-install-4:
+#   - docker run now passes --dns 8.8.8.8 and --dns 8.8.4.4 so containers
+#     can resolve hostnames on Azure VMs (168.63.129.16 doesn't work
+#     inside Docker).
+#   - docker run now passes --add-host host.docker.internal:host-gateway
+#     so containers can reach host-loopback services.
+#   - verify_registration_inner performs a DNS pre-check from inside the
+#     container before entering the 120s wait loop. If DNS resolution
+#     fails, the script returns immediately instead of timing out.
+#   - verify_registration_inner detects container death (exited/dead/missing)
+#     during the polling loop and fails fast instead of waiting the full
+#     120s.
+#   - CONTROL_PLANE_URL with localhost or 127.0.0.1 hostname is rewritten
+#     to host.docker.internal in agent.env for container networking.
+#
 # CHANGES SINCE v2.10.5-install-1:
 #   - Re-runs now UPGRADE the existing same-UUID container instead of
 #     failing with "port is already allocated" (aligns with SSH-deploy's
@@ -656,6 +671,18 @@ write_env_file() {
     mkdir -p "$ENV_FILE_DIR"
     chmod 0700 "$ENV_FILE_DIR" 2>/dev/null || true
 
+    # Rewrite localhost / 127.0.0.1 in CONTROL_PLANE_URL to
+    # host.docker.internal so the container can reach host-loopback
+    # services via the host-gateway alias added in install_supervisor.
+    # Non-loopback URLs and already-rewritten URLs are left untouched.
+    local effective_url="${CONTROL_PLANE_URL}"
+    if [[ "$effective_url" =~ ^(https?://)(localhost|127\.0\.0\.1)(:.*)?$ ]]; then
+        local scheme="${BASH_REMATCH[1]}"
+        local port="${BASH_REMATCH[3]:-}"
+        effective_url="${scheme}host.docker.internal${port}"
+        log_info "Rewrote CONTROL_PLANE_URL for container networking (localhost -> host.docker.internal)."
+    fi
+
     # Write to a temp file, then atomically move into place.
     local tmp_file="${ENV_FILE_DIR}/.agent.env.tmp.$$"
 
@@ -668,7 +695,7 @@ write_env_file() {
 RESOURCE_ID=${RESOURCE_ID}
 RESOURCE_TOKEN=${RESOURCE_TOKEN}
 WEBHOOK_SECRET=${WEBHOOK_SECRET}
-CONTROL_PLANE_URL=${CONTROL_PLANE_URL}
+CONTROL_PLANE_URL=${effective_url}
 
 # Optional defaults
 WEBHOOK_PORT=${WEBHOOK_PORT:-9091}
@@ -711,11 +738,20 @@ install_supervisor() {
     log_debug "docker run mount args: ${mount_args}"
 
     # Run with --label com.clawfarm.managed=true (AC-11).
+    # --dns 8.8.8.8 / --dns 8.8.4.4: Azure VMs use a DNS resolver
+    # (168.63.129.16) that doesn't resolve inside Docker containers.
+    # Explicitly set public DNS so the container can reach the control plane.
+    # --add-host host.docker.internal:host-gateway: allows the container
+    # to reach host-loopback services (needed when CONTROL_PLANE_URL
+    # points at localhost — rewritten in write_env_file).
     # shellcheck disable=SC2086  # word-splitting is intentional for mount_args
     docker run -d \
         --restart=unless-stopped \
         --name "$CONTAINER_NAME" \
         --label "$MANAGED_LABEL" \
+        --dns 8.8.8.8 \
+        --dns 8.8.4.4 \
+        --add-host host.docker.internal:host-gateway \
         $mount_args \
         --env-file "${ENV_FILE}" \
         -p 9091:9091 \
@@ -841,6 +877,29 @@ verify_registration_inner() {
 
     log_info "Verifying registration with control plane (timeout: 120s)..."
 
+    # DNS pre-check: extract hostname from CONTROL_PLANE_URL and test
+    # resolution from inside the container. Azure VMs use a DNS resolver
+    # (168.63.129.16) that doesn't work inside Docker containers — if the
+    # container can't resolve the control plane hostname, registration will
+    # never succeed, so we fail fast rather than waiting the full 120s.
+    local cp_hostname=""
+    # Strip scheme (http:// or https://) then strip port (:NNNN) and path.
+    cp_hostname="${CONTROL_PLANE_URL#*://}"
+    cp_hostname="${cp_hostname%%/*}"    # strip path
+    cp_hostname="${cp_hostname%%:*}"    # strip port
+    if [[ -n "$cp_hostname" ]]; then
+        log_debug "DNS pre-check: resolving '${cp_hostname}' inside container..."
+        if ! timeout 10 docker exec "$CONTAINER_NAME" \
+                python3 -c "import socket; socket.getaddrinfo('${cp_hostname}', 443)" \
+                >/dev/null 2>&1; then
+            log_error "DNS resolution failed inside container for '${cp_hostname}'."
+            log_error "Likely cause: host DNS resolver doesn't work inside Docker."
+            log_error "Ensure --dns 8.8.8.8 (or equivalent public DNS) is set on the container."
+            return 1
+        fi
+        log_debug "DNS pre-check passed: '${cp_hostname}' resolves inside container."
+    fi
+
     local max_iterations=24
     local sleep_interval=5
     local iter
@@ -850,6 +909,36 @@ verify_registration_inner() {
             log_info "Resource-agent successfully registered with control plane."
             return 0
         fi
+
+        # Container death detection (skip on iteration 1 — the container
+        # may still be starting up). If the container has exited, died, or
+        # disappeared, fail fast instead of waiting the full 120s.
+        if (( iter > 1 )); then
+            local container_state
+            container_state=$(docker inspect "$CONTAINER_NAME" \
+                --format '{{.State.Status}}' 2>/dev/null || echo "missing")
+            case "$container_state" in
+                exited|dead)
+                    log_error "Container exited during registration (state=${container_state})."
+                    # Run existing error classification on the logs we have.
+                    local _agent_logs
+                    _agent_logs=$(docker logs "$CONTAINER_NAME" 2>&1 || true)
+                    if echo "$_agent_logs" | grep -q "Registration rejected by control plane (HTTP 401)"; then
+                        log_error "Likely cause: wrong resource token (control plane rejected auth)."
+                    elif echo "$_agent_logs" | grep -qE "ClientError|Could not register"; then
+                        log_error "Likely cause: control plane unreachable (network error)."
+                    fi
+                    log_error "Last 30 log lines:"
+                    docker logs --tail 30 "$CONTAINER_NAME" >&2 2>/dev/null || true
+                    return 1
+                    ;;
+                missing)
+                    log_error "Container disappeared during registration."
+                    return 1
+                    ;;
+            esac
+        fi
+
         log_debug "Waiting for registration (iteration ${iter}/${max_iterations})..."
         sleep "$sleep_interval"
     done
