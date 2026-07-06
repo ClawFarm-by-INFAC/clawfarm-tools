@@ -806,10 +806,37 @@ ensure_directories() {
 # ---------------------------------------------------------------------------
 # Registration verification (inner — returns 0 on success, 1 on timeout).
 # ---------------------------------------------------------------------------
+# Plan 5 (resource-agent-registration Option B): supervisor v0.2.5+
+# is required to log the "Successfully registered with control plane"
+# line this function greps for. Pre-0.2.5 supervisors pass /health
+# checks but never log the line, causing this 120s loop to time out.
+# Pre-timeout version check below fails fast when the supervisor is
+# pre-0.2.5 — operators see "upgrade supervisor" instead of "did not
+# register within 120s".
 verify_registration_inner() {
     if [[ "$SKIP_VERIFY" == "true" ]]; then
         log_warn "Skipping registration verification per --skip-verify"
         return 0
+    fi
+
+    # Pre-timeout version check (Plan 5). Inspect the running container's
+    # image tag; if it's a semver < 0.2.5, fail fast with the upgrade
+    # message instead of waiting the full 120s. Defensively skip the
+    # check for non-semver tags (e.g. ":latest") — operators using
+    # :latest are responsible for tracking the version themselves.
+    local image_tag
+    image_tag=$(docker inspect "$CONTAINER_NAME" --format '{{.Config.Image}}' 2>/dev/null || echo "")
+    if [[ "$image_tag" =~ :([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+        local tag_version="${BASH_REMATCH[1]}"
+        if ! _version_at_least "$tag_version" "0.2.5"; then
+            log_error "Resource-agent supervisor $tag_version is too old."
+            log_error "Likely cause: supervisor pre-0.2.5 cannot self-register; upgrade the image to v0.2.5+."
+            log_error "  docker pull <registry>/resource-agent:0.2.5"
+            log_error "  docker rm -f $CONTAINER_NAME"
+            log_error "  # then re-run this bootstrap script"
+            log_error "See runbook: docs/ops/release-resource-agent.md"
+            return 1
+        fi
     fi
 
     log_info "Verifying registration with control plane (timeout: 120s)..."
@@ -828,8 +855,44 @@ verify_registration_inner() {
     done
 
     log_error "Resource-agent did not register within $((max_iterations * sleep_interval))s."
+    # Plan 5: post-timeout error classification — grep the agent logs
+    # for known failure signatures and print a one-line actionable
+    # cause. Falls through to the existing "Last 30 log lines" output
+    # for unclassified failures.
+    local agent_logs
+    agent_logs=$(docker logs "$CONTAINER_NAME" 2>&1 || true)
+    if echo "$agent_logs" | grep -q "Registration rejected by control plane (HTTP 401)"; then
+        log_error "Likely cause: wrong resource token (control plane rejected auth)."
+    elif echo "$agent_logs" | grep -q "Registration rejected by control plane (HTTP 403)"; then
+        log_error "Likely cause: agency suspended or token revoked (HTTP 403)."
+    elif echo "$agent_logs" | grep -q "Registration rejected by control plane (HTTP 404)"; then
+        log_error "Likely cause: backend version mismatch — update control plane (HTTP 404)."
+    elif echo "$agent_logs" | grep -qE "ClientError|Could not register"; then
+        log_error "Likely cause: control plane unreachable (network error)."
+    elif [[ -z "$agent_logs" ]]; then
+        log_error "Likely cause: supervisor pre-0.2.5 — upgrade resource-agent image to v0.2.5+."
+    else
+        log_error "Could not classify the failure. Last 30 log lines below."
+    fi
     log_error "Last 30 log lines:"
     docker logs --tail 30 "$CONTAINER_NAME" >&2 2>/dev/null || true
+    return 1
+}
+
+# Compare two semver strings (a >= b). Returns 0 if a >= b, 1 otherwise.
+# Used by verify_registration_inner's pre-timeout version check.
+_version_at_least() {
+    local a="$1"
+    local b="$2"
+    local a_major a_minor a_patch
+    local b_major b_minor b_patch
+    IFS='.' read -r a_major a_minor a_patch <<<"$a"
+    IFS='.' read -r b_major b_minor b_patch <<<"$b"
+    if (( a_major > b_major )); then return 0; fi
+    if (( a_major < b_major )); then return 1; fi
+    if (( a_minor > b_minor )); then return 0; fi
+    if (( a_minor < b_minor )); then return 1; fi
+    if (( a_patch >= b_patch )); then return 0; fi
     return 1
 }
 
