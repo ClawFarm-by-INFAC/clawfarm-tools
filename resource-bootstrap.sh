@@ -36,6 +36,19 @@
 #                         (default: $HOME/.local/share/clawfarm/gateways)
 #   ENV_FILE_DIR          Host-side XDG config directory holding agent.env
 #                         (default: $HOME/.config/clawfarm/resource-agent)
+#   GATEWAY_IMAGE_NAME    Gateway container image name (default:
+#                         clawfarmacrproduction.azurecr.io/openclaw-gateway).
+#                         Env-overridable so operators can point at a staging
+#                         registry. Written to agent.env for the supervisor.
+#   GATEWAY_IMAGE_TAG     Pinned per release (default: v0.4.1). NOT env-
+#                         overridable in production (deterministic installs).
+#                         Test-overridable via _TEST_GATEWAY_IMAGE_TAG.
+#
+# ACR_AUTH prerequisite: gateway containers are pulled from
+# clawfarmacrproduction.azurecr.io. Run `az acr login --name clawfarmacrproduction`
+# on the host before invoking this script if you haven't already. The script
+# does NOT configure auth automatically; it soft-verifies pull works (see
+# install_supervisor) and warns if auth is missing.
 #
 # Credential preservation (v2.10.5+):
 #   RESOURCE_TOKEN_PRESERVE=1     When set, an empty RESOURCE_TOKEN in the
@@ -63,6 +76,20 @@
 #   6  RESOURCE_ID is not a valid UUID
 #   7  Required env var is empty (RESOURCE_TOKEN or WEBHOOK_SECRET)
 #   8  CONTROL_PLANE_URL is not http(s)://
+#
+# CHANGES SINCE v2.10.5-install-5:
+#   - GATEWAY_IMAGE_NAME (env-overridable) and GATEWAY_IMAGE_TAG (pinned
+#     per release, test-overridable via _TEST_GATEWAY_IMAGE_TAG) are now
+#     written to agent.env so the supervisor starts with the correct
+#     per-agency gateway image even for non-backend-triggered operations
+#     (manual recreate, rollback). Same dual-audience tag policy as
+#     RESOURCE_AGENT_TAG: backend env vars (per-deployment) vs bootstrap
+#     pinned constants (per-release deterministic install).
+#   - install_supervisor() now soft-verifies that the pinned gateway image
+#     can be pulled from ACR, and WARNs (does NOT exit) if the pull fails.
+#     Operators see an actionable `az acr login` hint; the supervisor still
+#     starts because the image may be cached locally. Gateway provisioning
+#     will surface a real error later if the image truly is missing.
 #
 # CHANGES SINCE v2.10.5-install-4:
 #   - docker run now passes --dns 8.8.8.8 and --dns 8.8.4.4 so containers
@@ -120,6 +147,32 @@ fi
 
 # Default image registry — overridable via env var of the same name.
 RESOURCE_AGENT_IMAGE="${RESOURCE_AGENT_IMAGE:-clawfarmacrproduction.azurecr.io/resource-agent}"
+
+# ---------------------------------------------------------------------------
+# Gateway container image — pinned per release, env-overridable for the NAME
+# (operator can point at a staging registry) but NOT for the TAG (deterministic
+# installs per release; same design as RESOURCE_AGENT_TAG).
+#
+# Two audiences:
+#   - Backend env vars (GATEWAY_IMAGE_NAME/GATEWAY_IMAGE_TAG): per-deployment
+#     override, read by pending_work_service._resolve_gateway_image().
+#   - Bootstrap pinned constants (here): per-release deterministic install,
+#     written to agent.env so the supervisor starts with the correct image
+#     even for non-backend-triggered operations (manual recreate, rollback).
+# ---------------------------------------------------------------------------
+# NAME is env-overridable: operator can point at a staging registry or a
+# mirror. Default is the production ACR.
+GATEWAY_IMAGE_NAME="${GATEWAY_IMAGE_NAME:-clawfarmacrproduction.azurecr.io/openclaw-gateway}"
+
+# TAG is pinned non-overridable in production (deterministic installs), but
+# test-overridable via _TEST_GATEWAY_IMAGE_TAG for integration tests.
+if [[ -n "${_TEST_GATEWAY_IMAGE_TAG:-}" ]]; then
+    GATEWAY_IMAGE_TAG="$_TEST_GATEWAY_IMAGE_TAG"
+    _TEST_GATEWAY_WARNING="_TEST_GATEWAY_IMAGE_TAG is set — using test tag ${GATEWAY_IMAGE_TAG}. Not for production."
+else
+    GATEWAY_IMAGE_TAG="v0.4.1"
+    _TEST_GATEWAY_WARNING=""
+fi
 
 # Host-side XDG layout. These paths are created on the host (no sudo needed)
 # and bind-mounted into the container at /var/lib/* (see install_supervisor
@@ -705,6 +758,13 @@ GATEWAY_NETWORK_NAME=${GATEWAY_NETWORK_NAME:-}
 STATE_DIR=/var/lib/resource-agent
 GATEWAY_DATA_DIR=/var/lib/clawfarm/gateways
 LOG_LEVEL=${LOG_LEVEL:-INFO}
+
+# Gateway image — pinned per release by the bootstrap script. The supervisor
+# reads these to know which image to docker run for per-agency gateways.
+# Backend env vars (per-deployment override) take precedence; these pinned
+# values are the per-release deterministic install default.
+GATEWAY_IMAGE_NAME=${GATEWAY_IMAGE_NAME}
+GATEWAY_IMAGE_TAG=${GATEWAY_IMAGE_TAG}
 EOF
 
     # Set permissions before moving into place.
@@ -733,6 +793,23 @@ install_supervisor() {
     else
         # Include the docker socket mount by default.
         mount_args=$(build_mount_args "default")
+    fi
+
+    # Soft-verify ACR auth: warn (do NOT exit) if the pinned gateway image
+    # can't be pulled. The supervisor may still come up from a cached image,
+    # but the operator should know auth may be missing. The resource-agent
+    # supervisor itself uses a separate image (RESOURCE_AGENT_IMAGE) which
+    # was already pulled by pull_image() — this check is for the GATEWAY
+    # image that the supervisor will later docker run for per-agency gateways.
+    # Soft-fail: log warnings but proceed; gateway provisioning will retry
+    # pulls at provision time and can surface the error there.
+    local gateway_image="${GATEWAY_IMAGE_NAME}:${GATEWAY_IMAGE_TAG}"
+    if ! docker pull "${gateway_image}" >/dev/null 2>&1; then
+        log_warn "Could not pull ${gateway_image} — ACR auth may be missing."
+        log_warn "Run: az acr login --name clawfarmacrproduction  (then re-run this script)"
+        log_warn "Supervisor will still start; gateway provisioning may fail later if the image is not cached."
+    else
+        log_debug "Gateway image pullable: ${gateway_image}"
     fi
 
     log_debug "docker run mount args: ${mount_args}"
@@ -1006,8 +1083,13 @@ main() {
     log_info "ClawFarm Resource-Agent Bootstrap starting..."
     log_debug "RESOURCE_AGENT_TAG=${RESOURCE_AGENT_TAG}"
     log_debug "RESOURCE_AGENT_IMAGE=${RESOURCE_AGENT_IMAGE}"
+    log_debug "GATEWAY_IMAGE_TAG=${GATEWAY_IMAGE_TAG}"
+    log_debug "GATEWAY_IMAGE_NAME=${GATEWAY_IMAGE_NAME}"
     if [[ -n "$_TEST_TAG_WARNING" ]]; then
         log_warn "$_TEST_TAG_WARNING"
+    fi
+    if [[ -n "${_TEST_GATEWAY_WARNING:-}" ]]; then
+        log_warn "$_TEST_GATEWAY_WARNING"
     fi
 
     validate_env
