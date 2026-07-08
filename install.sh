@@ -6,8 +6,8 @@
 #   lib dir:     /home/ambling/Projects/ClawFarm/scripts/deploy/lib
 #   template dir: /home/ambling/Projects/ClawFarm/scripts/deploy/templates
 # Bundler path:  /home/ambling/Projects/ClawFarm/scripts/deploy/bundle-install-sh.sh
-# Generated:     2026-07-06T18:52:35Z
-BUNDLED_VERSION="v2.10.5-install-2"
+# Generated:     2026-07-08T22:57:22Z
+BUNDLED_VERSION="v2.10.7-install-1"
 # =============================================================================
 
 set -euo pipefail
@@ -28,6 +28,7 @@ cat >"${TEMPLATE_DIR}/.env.template" <<'_BUNDLED_TEMPLATE__env_template_'
 # DO NOT check this file into version control
 
 # Docker Configuration
+# clawfarm-central-config: ignore — template default; operator fills via env at render time
 REGISTRY=${REGISTRY:-clawfarmacrproduction.azurecr.io}
 IMAGE_TAG=${IMAGE_TAG:-latest}
 IMAGE_TAG_SEPARATOR=${IMAGE_TAG_SEPARATOR:-:}
@@ -79,6 +80,7 @@ version: '3.8'
 
 services:
   openclaw-gateway:
+    # clawfarm-central-config: ignore — template literal with full ${VAR} substitution; rendered at deploy time
     image: ${REGISTRY:-clawfarmacrproduction.azurecr.io}/openclaw-gateway${IMAGE_TAG_SEPARATOR:-}${IMAGE_TAG:-latest}
     container_name: ${GATEWAY_NAME:-openclaw-gateway}
     # Extra hosts needed for CDP access to host
@@ -805,6 +807,68 @@ export -f validate_env_file
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# >>> bundled lib: _load-clawfarm-env.sh
+# ---------------------------------------------------------------------------
+# _load-clawfarm-env.sh — shared loader for central config (CC-T8)
+#
+# Sources clawfarm.env from the repo root into the calling shell's
+# environment so deploy scripts can use ${VAR:-${CENTRAL_VAR}} patterns
+# for image / registry / port defaults.
+#
+# Usage (at the top of any deploy script, after `set -euo pipefail`):
+#   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#   source "${SCRIPT_DIR}/lib/_load-clawfarm-env.sh"
+#
+# Override layers (highest precedence wins):
+#   1. Runtime env vars already set in the calling shell.
+#   2. Per-env override (clawfarm.<CLAWFARM_ENV>.env) if CLAWFARM_ENV is set.
+#   3. Base clawfarm.env (this file).
+#
+# IMPORTANT: Runtime env vars already set in the calling shell take
+# precedence — clawfarm.env values only apply to variables that are NOT
+# already set. This preserves the per-invocation ${VAR:-default} override
+# pattern used by every deploy script.
+
+_CLAWFARM_ENV_HELPER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_CLAWFARM_ENV_REPO_ROOT="$(cd "${_CLAWFARM_ENV_HELPER_DIR}/../../.." && pwd)"
+_CLAWFARM_ENV_CONFIG_PATH="${CLAWFARM_CONFIG_PATH:-${_CLAWFARM_ENV_REPO_ROOT}/clawfarm.env}"
+
+# Load a KEY=VALUE file without clobbering existing env vars.
+# Only sets variables that are not already defined (runtime override wins).
+_clawfarm_env_load_file() {
+    local file="$1"
+    if [[ ! -f "${file}" ]]; then
+        return 0
+    fi
+    local key value
+    while IFS='=' read -r key value; do
+        # Skip blank lines and comments (# at start of key).
+        [[ -z "${key}" || "${key}" == \#* ]] && continue
+        # Skip invalid variable names.
+        [[ ! "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && continue
+        # Only set if not already defined (runtime env var takes precedence).
+        if [[ -z "${!key+x}" ]]; then
+            export "${key}=${value}"
+        fi
+    done < "${file}"
+}
+
+# Load base clawfarm.env.
+_clawfarm_env_load_file "${_CLAWFARM_ENV_CONFIG_PATH}"
+
+# Load per-env override file if CLAWFARM_ENV is set (e.g., local, prod).
+if [[ -n "${CLAWFARM_ENV:-}" ]]; then
+    _clawfarm_env_load_file "${_CLAWFARM_ENV_REPO_ROOT}/clawfarm.${CLAWFARM_ENV}.env"
+fi
+
+# Clean up helper-local variables + function so they don't leak.
+unset -f _clawfarm_env_load_file
+unset _CLAWFARM_ENV_HELPER_DIR _CLAWFARM_ENV_REPO_ROOT _CLAWFARM_ENV_CONFIG_PATH
+# ---------------------------------------------------------------------------
+# <<< end bundled lib: _load-clawfarm-env.sh
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # >>> bundled lib: config.sh
 # ---------------------------------------------------------------------------
 # config.sh - Configuration generation and template rendering library
@@ -817,10 +881,10 @@ export -f validate_env_file
 
 # Template directory
 
-# Default values
+# Default values (registry + port sourced from clawfarm.env via _load-clawfarm-env.sh)
 DEFAULT_CONTROL_PLANE_URL="${CONTROL_PLANE_API_URL:-https://api.clawfarm.ca/v1}"
-DEFAULT_REGISTRY="${REGISTRY_URL:-clawfarmacrproduction.azurecr.io}"
-DEFAULT_GATEWAY_PORT="${GATEWAY_PORT:-18789}"
+DEFAULT_REGISTRY="${REGISTRY_URL:-${ACR_REGISTRY}}"
+DEFAULT_GATEWAY_PORT="${GATEWAY_PORT:-${GATEWAY_INTERNAL_PORT}}"
 DEFAULT_LOG_LEVEL="${LOG_LEVEL:-info}"
 
 # ============================================================================
@@ -1003,7 +1067,12 @@ generate_compose_file() {
 
   # Create docker-compose.yml that references .env file
   if [[ ! -f "$template_file" ]]; then
-    # Create default content if template doesn't exist
+    # Create default content if template doesn't exist.
+    # NOTE: the fallback heredoc below contains `clawfarmacrproduction.azurecr.io`
+    # as a ${REGISTRY:-default} fallback for VPS deploys. This is a compose-template
+    # literal, not a runtime image default — tracked as `ignore` in the central-config
+    # inventory (CC-T0). The drift check sweep skips this file via SCAN_LIST_FILES.
+    # clawfarm-central-config: ignore — compose-template fallback literal in heredoc below (lines ~209+)
     cat > "$output_file" <<'EOF'
 version: '3.8'
 
@@ -2115,8 +2184,8 @@ HEALTH_CHECK_TIMEOUT="${HEALTH_CHECK_TIMEOUT:-120}"
 HEALTH_CHECK_INTERVAL="${HEALTH_CHECK_INTERVAL:-5}"
 HEALTH_CHECK_RETRIES="$((HEALTH_CHECK_TIMEOUT / HEALTH_CHECK_INTERVAL))"
 
-# Default images to pull
-DEFAULT_IMAGES="${DEFAULT_IMAGES:-openclaw-gateway}"
+# Default images to pull (basename from clawfarm.env GATEWAY_IMAGE_NAME via _load-clawfarm-env.sh)
+DEFAULT_IMAGES="${DEFAULT_IMAGES:-${GATEWAY_IMAGE_NAME##*/}}"
 
 # Docker commands (can be overridden for testing)
 DOCKER_COMPOSE_CMD="${DOCKER_COMPOSE_CMD:-}"
@@ -2297,7 +2366,8 @@ generate_configuration() {
 #   Latest tag name, or "latest" if detection fails
 get_latest_image_tag() {
   local registry="$1"
-  local image_name="${registry}/openclaw-gateway"
+  # Repo basename from clawfarm.env GATEWAY_IMAGE_NAME via _load-clawfarm-env.sh
+  local image_name="${registry}/${GATEWAY_IMAGE_NAME##*/}"
 
   local latest_tag=""
 
