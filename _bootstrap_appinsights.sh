@@ -58,3 +58,20 @@ resolve_appinsights() {
         return 0
     fi
 }
+
+# emit_tracing_env_block — produce the env-file tracing line(s) for
+# write_env_file. Returns one of two shapes via stdout:
+#
+#   APPLICATIONINSIGHTS_CONNECTION_STRING=<value>   (when Key Vault resolves)
+#   OTEL_SDK_DISABLED=true                          (dev fallback)
+#
+# Caller appends the output to the env file verbatim.
+emit_tracing_env_block() {
+    local appinsights_cs
+    appinsights_cs=$(resolve_appinsights)
+    if [[ -n "$appinsights_cs" ]]; then
+        echo "APPLICATIONINSIGHTS_CONNECTION_STRING=${appinsights_cs}"
+    else
+        echo "OTEL_SDK_DISABLED=true"
+    fi
+}
