@@ -719,6 +719,58 @@ sweep_legacy_container() {
 # ---------------------------------------------------------------------------
 # Write $ENV_FILE (mode 0600, owned by calling user).
 # ---------------------------------------------------------------------------
+# App Insights Key Vault helper — inlined from public/tools/_bootstrap_appinsights.sh
+# (canonical source for tests at scripts/deploy/test/bootstrap_appinsights_test.bats).
+# Keep the two copies in sync; a future bundler enhancement may automate this.
+#
+# Mirrors Flow A's _resolve_appinsights_from_kvmaybe (lib/resource-agent.sh:265-287,
+# deleted in the Flow A retirement plan) with one improvement: emits a stderr
+# warning when APPINSIGHTS_KV_SECRET_NAME is set AND az CLI is available BUT the
+# secret fetch returns empty (D9 — silent observability failure class).
+resolve_appinsights() {
+    local secret_name="${APPINSIGHTS_KV_SECRET_NAME:-}"
+    if [[ -z "$secret_name" ]]; then
+        return 0
+    fi
+
+    if ! command -v az >/dev/null 2>&1; then
+        echo "WARNING: APPINSIGHTS_KV_SECRET_NAME set but az CLI not available; skipping App Insights" >&2
+        return 0
+    fi
+
+    local vault="${AZURE_KEY_VAULT_NAME:-}"
+    if [[ -z "$vault" ]]; then
+        vault=$(keyvault_discovery_default 2>/dev/null || true)
+    fi
+    if [[ -z "$vault" ]]; then
+        echo "WARNING: APPINSIGHTS_KV_SECRET_NAME set but no Key Vault resolved; set AZURE_KEY_VAULT_NAME" >&2
+        return 0
+    fi
+
+    local value
+    value=$(az keyvault secret show --name "$secret_name" --vault-name "$vault" --query 'value' -o tsv 2>/dev/null) || true
+    if [[ -n "$value" ]]; then
+        printf '%s' "$value"
+    else
+        echo "WARNING: APPINSIGHTS_KV_SECRET_NAME set but secret lookup failed (vault=${vault}, secret=${secret_name})" >&2
+        return 0
+    fi
+}
+
+# emit_tracing_env_block — produce the env-file tracing line(s) for write_env_file.
+# Returns one of two shapes via stdout:
+#   APPLICATIONINSIGHTS_CONNECTION_STRING=<value>   (when Key Vault resolves)
+#   OTEL_SDK_DISABLED=true                          (dev fallback)
+emit_tracing_env_block() {
+    local appinsights_cs
+    appinsights_cs=$(resolve_appinsights)
+    if [[ -n "$appinsights_cs" ]]; then
+        echo "APPLICATIONINSIGHTS_CONNECTION_STRING=${appinsights_cs}"
+    else
+        echo "OTEL_SDK_DISABLED=true"
+    fi
+}
+
 write_env_file() {
     # Create directory with mode 0700 (private to the calling user).
     mkdir -p "$ENV_FILE_DIR"
@@ -735,6 +787,10 @@ write_env_file() {
         effective_url="${scheme}host.docker.internal${port}"
         log_info "Rewrote CONTROL_PLANE_URL for container networking (localhost -> host.docker.internal)."
     fi
+
+    # Resolve tracing env block (D8: re-fetch each run, no preservation).
+    local tracing_block
+    tracing_block=$(emit_tracing_env_block)
 
     # Write to a temp file, then atomically move into place.
     local tmp_file="${ENV_FILE_DIR}/.agent.env.tmp.$$"
@@ -765,6 +821,10 @@ LOG_LEVEL=${LOG_LEVEL:-INFO}
 # values are the per-release deterministic install default.
 GATEWAY_IMAGE_NAME=${GATEWAY_IMAGE_NAME}
 GATEWAY_IMAGE_TAG=${GATEWAY_IMAGE_TAG}
+
+# Tracing — APPLICATIONINSIGHTS_CONNECTION_STRING (prod) or OTEL_SDK_DISABLED (dev).
+# Re-resolved each bootstrap run (D8); picks up Key Vault rotations automatically.
+${tracing_block}
 EOF
 
     # Set permissions before moving into place.
