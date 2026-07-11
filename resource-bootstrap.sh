@@ -723,6 +723,7 @@ sweep_legacy_container() {
 # (canonical source for tests at scripts/deploy/test/bootstrap_appinsights_test.bats).
 # Keep the two copies in sync; a future bundler enhancement may automate this.
 #
+# deleted-file-refs: ignore
 # Mirrors Flow A's _resolve_appinsights_from_kvmaybe (lib/resource-agent.sh:265-287,
 # deleted in the Flow A retirement plan) with one improvement: emits a stderr
 # warning when APPINSIGHTS_KV_SECRET_NAME is set AND az CLI is available BUT the

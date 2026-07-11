@@ -3,6 +3,7 @@
 # from Azure Key Vault for resource-bootstrap.sh (Flow B).
 #
 # Sourced by public/tools/resource-bootstrap.sh before write_env_file().
+# deleted-file-refs: ignore
 # Mirrors the logic in scripts/deploy/lib/resource-agent.sh:265-287 (Flow A,
 # deleted in the Flow A retirement plan) with one improvement: emits a
 # stderr warning when APPINSIGHTS_KV_SECRET_NAME is set AND az CLI is
