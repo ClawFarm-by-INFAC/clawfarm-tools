@@ -1195,6 +1195,23 @@ main() {
                 log_info "Bootstrap complete (force-upgraded)."
             else
                 # AC-1 no-op path.
+                # D8 contract: App Insights env block re-fetches each run.
+                # Even on a no-op (same-tag re-run), refresh the tracing
+                # line so Key Vault secret rotations land in agent.env
+                # without forcing the operator to bump the image tag.
+                # Only rewrite the tracing block — leave RESOURCE_TOKEN/
+                # WEBHOOK_SECRET/etc. alone (write_env_file would rewrite
+                # the whole file, which we don't want on a no-op).
+                if [[ -f "$ENV_FILE" ]]; then
+                    local _tracing_line
+                    _tracing_line=$(emit_tracing_env_block)
+                    # Strip any existing tracing line(s) then append the fresh one.
+                    grep -vE '^(APPLICATIONINSIGHTS_CONNECTION_STRING|OTEL_SDK_DISABLED)=' "$ENV_FILE" > "${ENV_FILE}.tmp" || true
+                    echo "$_tracing_line" >> "${ENV_FILE}.tmp"
+                    mv "${ENV_FILE}.tmp" "$ENV_FILE"
+                    chmod 0600 "$ENV_FILE" 2>/dev/null || true
+                    log_info "Refreshed tracing env block on no-op rerun (D8 contract)."
+                fi
                 log_info "No-op: running tag=${RESOURCE_AGENT_TAG} matches pinned tag=${RESOURCE_AGENT_TAG} (status=Up)."
                 exit 0
             fi
