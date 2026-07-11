@@ -170,7 +170,7 @@ if [[ -n "${_TEST_GATEWAY_IMAGE_TAG:-}" ]]; then
     GATEWAY_IMAGE_TAG="$_TEST_GATEWAY_IMAGE_TAG"
     _TEST_GATEWAY_WARNING="_TEST_GATEWAY_IMAGE_TAG is set — using test tag ${GATEWAY_IMAGE_TAG}. Not for production."
 else
-    GATEWAY_IMAGE_TAG="v0.4.1"
+    GATEWAY_IMAGE_TAG="v0.4.3"
     _TEST_GATEWAY_WARNING=""
 fi
 
