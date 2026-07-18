@@ -843,6 +843,10 @@ EOF
 # Args (via env vars consumed by build_mount_args):
 #   REUSE_MOUNTS — when non-empty, build_mount_args reuses these host paths
 #                  verbatim (UC-1 / AC-2-cross-path).
+#   WEBHOOK_HOST_PORT_OVERRIDE — when set, overrides the HOST port published
+#                  by -p (container port stays 9091). Used by blue-green
+#                  upgrade to run the new container on a temporary host port
+#                  while the old container still holds 9091.
 # ---------------------------------------------------------------------------
 install_supervisor() {
     # Build the -v args. If REUSE_MOUNTS is set (from read_existing_mounts),
@@ -873,7 +877,12 @@ install_supervisor() {
         log_debug "Gateway image pullable: ${gateway_image}"
     fi
 
+    # Host port to publish. Default: 9091 (canonical WEBHOOK_PORT). Blue-green
+    # upgrade overrides this via WEBHOOK_HOST_PORT_OVERRIDE so the candidate
+    # container can coexist with -prev (which still holds 9091).
+    local host_port="${WEBHOOK_HOST_PORT_OVERRIDE:-${WEBHOOK_PORT:-9091}}"
     log_debug "docker run mount args: ${mount_args}"
+    log_debug "docker run host port: ${host_port} (override=${WEBHOOK_HOST_PORT_OVERRIDE:-unset})"
 
     # Run with --label com.clawfarm.managed=true (AC-11).
     # --dns 8.8.8.8 / --dns 8.8.4.4: Azure VMs use a DNS resolver
@@ -883,7 +892,7 @@ install_supervisor() {
     # to reach host-loopback services (needed when CONTROL_PLANE_URL
     # points at localhost — rewritten in write_env_file).
     # shellcheck disable=SC2086  # word-splitting is intentional for mount_args
-    docker run -d \
+    if ! docker run -d \
         --restart=unless-stopped \
         --name "$CONTAINER_NAME" \
         --label "$MANAGED_LABEL" \
@@ -892,19 +901,62 @@ install_supervisor() {
         --add-host host.docker.internal:host-gateway \
         $mount_args \
         --env-file "${ENV_FILE}" \
-        -p 9091:9091 \
-        "${RESOURCE_AGENT_IMAGE}:${RESOURCE_AGENT_TAG}" >&2
+        -p "${host_port}:9091" \
+        "${RESOURCE_AGENT_IMAGE}:${RESOURCE_AGENT_TAG}" >&2; then
+        log_error "docker run failed (exit $?)."
+        return 1
+    fi
 
-    log_info "Installed ${CONTAINER_NAME} container with restart=unless-stopped"
+    # State check: `docker run -d` can return exit 0 even when the container
+    # fails to start (e.g. port conflict, bad image, bad mount). Verify the
+    # container actually reached "running" state before declaring success.
+    # Without this, downstream steps (DNS pre-check, verify_registration) hit
+    # a stopped container and produce misleading errors.
+    local run_state
+    run_state=$(docker inspect "$CONTAINER_NAME" --format '{{.State.Status}}' 2>/dev/null || echo missing)
+    if [[ "$run_state" != "running" ]]; then
+        log_error "Container ${CONTAINER_NAME} is not running after docker run (state=${run_state})."
+        log_error "Last 20 log lines:"
+        docker logs --tail 20 "$CONTAINER_NAME" >&2 2>/dev/null || true
+        log_error "Removing failed container."
+        docker rm -f "$CONTAINER_NAME" >&2 2>/dev/null || true
+        return 1
+    fi
+
+    if [[ -n "${WEBHOOK_HOST_PORT_OVERRIDE:-}" ]]; then
+        log_info "Installed ${CONTAINER_NAME} on temp host port ${host_port} (container port 9091) with restart=unless-stopped"
+    else
+        log_info "Installed ${CONTAINER_NAME} container with restart=unless-stopped"
+    fi
 }
 
 # ---------------------------------------------------------------------------
-# Upgrade path (UC-4 / AC-2).
+# Upgrade path (UC-4 / AC-2). BLUE-GREEN, no port conflict.
 #
-# upgrade_existing_container() renames the existing container to
-# <CONTAINER_NAME>-prev, runs the new container with the SAME mounts,
-# and verifies registration. On success, removes -prev. On failure,
-# removes the failed new container and restarts -prev.
+# upgrade_existing_container() performs a blue-green swap:
+#   Phase 1: rename existing → <NAME>-prev (still running, still holds 9091).
+#            Run NEW container with the canonical <NAME> on a TEMPORARY host
+#            port (canonical + 10000, e.g. 19091). Container port stays 9091,
+#            so in-container health checks work. -prev and NEW coexist on
+#            different host ports — no conflict.
+#   Phase 2: verify NEW registration via docker exec (in-container, port-
+#            agnostic). If verification fails, roll back: remove NEW, restart
+#            -prev, rename -prev back to canonical.
+#   Phase 3: NEW is healthy. Stop -prev (releases canonical host port 9091).
+#            Remove NEW (was on temp port), re-run NEW with canonical port.
+#            Re-verify. On failure, restart -prev as emergency rollback.
+#   Phase 4: success — remove -prev.
+#
+# Why this design: the old upgrade renamed existing → -prev but did not stop
+# it, so -prev kept holding 9091. The new `docker run -p 9091:9091` then
+# failed with "port is already allocated", leaving the new container stuck
+# in "Created" state. The downstream DNS pre-check hit a non-running
+# container and produced a misleading "DNS resolution failed" error.
+#
+# Downtime profile: Phase 3 has a ~1-3s window during NEW's recreation on
+# canonical ports. resource-agent dispatch is polling-based (/api/poll every
+# 30s); webhooks are a latency optimization. Missed webhooks during the swap
+# get re-polled within 30s. Effectively zero functional downtime.
 #
 # Args:
 #   $1 — existing container status (for log context)
@@ -913,6 +965,8 @@ upgrade_existing_container() {
     local existing_status="$1"
     local prev_name="${CONTAINER_NAME}-prev"
     local pinned_image="${RESOURCE_AGENT_IMAGE}:${RESOURCE_AGENT_TAG}"
+    local canonical_port="${WEBHOOK_PORT:-9091}"
+    local temp_port=$((canonical_port + 10000))
 
     # Read existing container's mounts so we can reuse the host paths
     # verbatim (UC-1 / AC-2-cross-path).
@@ -924,29 +978,37 @@ upgrade_existing_container() {
     # is untouched — no rename happened yet.
     pull_image
 
-    # Rename existing container to -prev BEFORE running the new one.
-    log_info "Upgrading: existing=${existing_status} new=${pinned_image}, renaming existing to ${prev_name}"
+    # Phase 1: rename existing → -prev (still running, still holds canonical
+    # port). Releases the canonical CONTAINER_NAME so we can reuse it for NEW.
+    log_info "Upgrading (blue-green): existing=${existing_status} new=${pinned_image}, renaming existing to ${prev_name}"
     if ! docker rename "$CONTAINER_NAME" "$prev_name" >&2 2>&1; then
         log_error "Failed to rename existing container ${CONTAINER_NAME} to ${prev_name}."
         log_error "Aborting upgrade; existing container is untouched."
         exit 2
     fi
 
-    # Run the new container (reuses existing mounts via REUSE_MOUNTS).
-    if ! install_supervisor; then
-        log_error "docker run of new container failed. Rolling back to ${prev_name}."
-        docker start "$prev_name" >&2 2>/dev/null || true
+    # Phase 1 (cont.): run NEW on temp host port. -prev still serves 9091.
+    log_info "Phase 1: installing NEW on temp host port ${temp_port} (container port 9091); -prev keeps serving ${canonical_port}"
+    if ! WEBHOOK_HOST_PORT_OVERRIDE="$temp_port" install_supervisor; then
+        log_error "docker run of NEW container (temp port ${temp_port}) failed. Rolling back to ${prev_name}."
+        docker rm -f "$CONTAINER_NAME" >&2 2>/dev/null || true
+        if docker start "$prev_name" >&2 2>/dev/null; then
+            docker rename "$prev_name" "$CONTAINER_NAME" >&2 2>/dev/null || true
+        else
+            log_error "FATAL: could not restart ${prev_name}. The agent is DOWN. See ${ROLLBACK_RUNBOOK_URL}"
+        fi
         exit 2
     fi
 
-    # Verify registration. On failure, roll back.
+    # Phase 2: verify NEW registration. Uses docker exec → in-container
+    # localhost:9091, independent of the host port mapping.
+    log_info "Phase 2: verifying NEW registration on temp port..."
     if ! verify_registration_inner; then
-        log_error "Registration verification failed for the new container."
-        log_error "Removing the failed new container ${CONTAINER_NAME}..."
+        log_error "Registration verification failed for the NEW container."
+        log_error "Removing the failed NEW container ${CONTAINER_NAME}..."
         docker rm -f "$CONTAINER_NAME" >&2 2>/dev/null || true
         log_info "Rolled back to previous: restarting ${prev_name} (new image failed registration). See ${ROLLBACK_RUNBOOK_URL}"
         if docker start "$prev_name" >&2 2>/dev/null; then
-            # Optional best-effort: rename prev back to the canonical name.
             docker rename "$prev_name" "$CONTAINER_NAME" >&2 2>/dev/null || true
         else
             log_error "FATAL: could not restart ${prev_name}. The agent is DOWN. See ${ROLLBACK_RUNBOOK_URL}"
@@ -954,8 +1016,44 @@ upgrade_existing_container() {
         exit 5
     fi
 
-    # Success: remove the -prev container.
-    log_info "Upgraded successfully. Removing previous container ${prev_name}."
+    # Phase 3: NEW verified healthy on temp port. Swap to canonical port.
+    # Stop -prev to release host port 9091, then recreate NEW on canonical
+    # port. Docker cannot remap ports without recreate, so this is a brief
+    # (1-3s) recreation window.
+    log_info "Phase 3: NEW healthy. Stopping -prev and recreating NEW on canonical port ${canonical_port}..."
+    docker stop -t 5 "$prev_name" >&2 2>/dev/null || true
+    docker rm -f "$CONTAINER_NAME" >&2 2>/dev/null || true
+
+    if ! WEBHOOK_HOST_PORT_OVERRIDE="" install_supervisor; then
+        log_error "FATAL: NEW failed to start on canonical port after swap."
+        log_error "Attempting emergency rollback to -prev..."
+        docker rm -f "$CONTAINER_NAME" >&2 2>/dev/null || true
+        if docker start "$prev_name" >&2 2>/dev/null; then
+            docker rename "$prev_name" "$CONTAINER_NAME" >&2 2>/dev/null || true
+            log_error "Rolled back to -prev on canonical name. See ${ROLLBACK_RUNBOOK_URL}"
+        else
+            log_error "FATAL: could not restart ${prev_name}. The agent is DOWN. See ${ROLLBACK_RUNBOOK_URL}"
+        fi
+        exit 5
+    fi
+
+    # Phase 3 (cont.): re-verify NEW on canonical port. Brief check.
+    log_info "Phase 3: re-verifying NEW on canonical port..."
+    if ! verify_registration_inner; then
+        log_error "FATAL: NEW failed post-swap verification on canonical port."
+        log_error "Attempting emergency rollback to -prev..."
+        docker rm -f "$CONTAINER_NAME" >&2 2>/dev/null || true
+        if docker start "$prev_name" >&2 2>/dev/null; then
+            docker rename "$prev_name" "$CONTAINER_NAME" >&2 2>/dev/null || true
+            log_error "Rolled back to -prev on canonical name. See ${ROLLBACK_RUNBOOK_URL}"
+        else
+            log_error "FATAL: could not restart ${prev_name}. The agent is DOWN. See ${ROLLBACK_RUNBOOK_URL}"
+        fi
+        exit 5
+    fi
+
+    # Phase 4: success. Remove -prev.
+    log_info "Phase 4: blue-green upgrade complete. Removing previous container ${prev_name}."
     docker rm -f "$prev_name" >&2 2>/dev/null || true
 }
 
@@ -1030,9 +1128,21 @@ verify_registration_inner() {
         if ! timeout 10 docker exec "$CONTAINER_NAME" \
                 python3 -c "import socket; socket.getaddrinfo('${cp_hostname}', 443)" \
                 >/dev/null 2>&1; then
-            log_error "DNS resolution failed inside container for '${cp_hostname}'."
-            log_error "Likely cause: host DNS resolver doesn't work inside Docker."
-            log_error "Ensure --dns 8.8.8.8 (or equivalent public DNS) is set on the container."
+            # docker exec returns non-zero for ANY reason — distinguish
+            # "container is not running" (e.g. start failed earlier due to
+            # port conflict) from genuine DNS failure. Without this, a
+            # port-conflict at docker run gets misreported as a DNS issue.
+            local pre_state
+            pre_state=$(docker inspect "$CONTAINER_NAME" --format '{{.State.Status}}' 2>/dev/null || echo missing)
+            if [[ "$pre_state" != "running" ]]; then
+                log_error "Cannot run DNS pre-check: container is not running (state=${pre_state})."
+                log_error "Likely cause: docker run failed earlier (port conflict, image issue, bad mount)."
+                log_error "Inspect 'docker logs ${CONTAINER_NAME}' for the actual start failure."
+            else
+                log_error "DNS resolution failed inside container for '${cp_hostname}'."
+                log_error "Likely cause: host DNS resolver doesn't work inside Docker."
+                log_error "Ensure --dns 8.8.8.8 (or equivalent public DNS) is set on the container."
+            fi
             return 1
         fi
         log_debug "DNS pre-check passed: '${cp_hostname}' resolves inside container."
