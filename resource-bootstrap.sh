@@ -141,7 +141,7 @@ if [[ -n "${_TEST_RESOURCE_AGENT_TAG:-}" ]]; then
     RESOURCE_AGENT_TAG="$_TEST_RESOURCE_AGENT_TAG"
     _TEST_TAG_WARNING="_TEST_RESOURCE_AGENT_TAG is set — using test tag ${RESOURCE_AGENT_TAG}. Not for production."
 else
-    RESOURCE_AGENT_TAG="0.2.8"
+    RESOURCE_AGENT_TAG="0.2.9"
     _TEST_TAG_WARNING=""
 fi
 
